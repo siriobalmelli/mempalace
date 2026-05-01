@@ -52,6 +52,31 @@ When the AI first calls `mempalace_status`, it receives the **Memory Protocol** 
 
 This protocol is what turns storage into memory — the AI knows to verify before speaking.
 
+## Concurrency Safety
+
+Multiple MCP clients may point at the same palace.
+Mutating tools acquire the same per-palace write lock used by `mempalace mine`, so drawer, diary, and knowledge-graph writes serialize with mines and with other MCP writes for that palace.
+Different palace paths use different lock keys and do not block each other.
+Read-only tools do not acquire the write lock.
+
+An MCP write may wait behind an active mine or another MCP write.
+The wait timeout defaults to 60 seconds and can be changed with `MEMPALACE_MCP_WRITE_LOCK_TIMEOUT`.
+On timeout, the tool returns a structured result instead of crashing the MCP server:
+
+```json
+{
+  "success": false,
+  "error": "palace write lock timeout",
+  "palace_path": "/path/to/palace"
+}
+```
+
+Selected-palace state uses the effective palace path from `--palace`, `MEMPALACE_PALACE_PATH`, `MEMPAL_PALACE_PATH`, config, or the default.
+The knowledge graph lives at `<palace>/knowledge_graph.sqlite3`.
+If the legacy `~/.mempalace/knowledge_graph.sqlite3` exists and the selected palace has no graph yet, MemPalace copies the legacy graph into the selected palace and leaves the original file intact.
+The WAL remains at `~/.mempalace/wal/write_log.jsonl` for compatibility, but every entry records the effective `palace_path` and redacts user content.
+Explicit tunnels currently remain at `~/.mempalace/tunnels.json` and use their existing file lock; palace-scoped tunnel storage is a follow-up.
+
 ## Tool Overview
 
 ### Palace (read)
