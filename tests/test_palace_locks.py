@@ -17,8 +17,10 @@ import pytest
 
 from mempalace.palace import (
     MineAlreadyRunning,
+    PalaceWriteLockTimeout,
     mine_global_lock,
     mine_palace_lock,
+    palace_write_lock,
 )
 
 
@@ -59,6 +61,23 @@ def _hold_lock(palace_path: str, ready_flag: str, release_flag: str) -> int:
         return 1
 
 
+def _hold_write_lock(palace_path: str, ready_flag: str, release_flag: str) -> None:
+    """Acquire palace_write_lock, signal readiness, wait for release flag."""
+    with palace_write_lock(palace_path, blocking=True, timeout=5.0, purpose="test_holder"):
+        open(ready_flag, "w").close()
+        for _ in range(500):
+            if os.path.exists(release_flag):
+                return
+            time.sleep(0.01)
+
+
+def _blocking_write_lock_waiter(palace_path: str, started_flag: str, acquired_flag: str) -> None:
+    """Block on palace_write_lock until the holder releases it."""
+    open(started_flag, "w").close()
+    with palace_write_lock(palace_path, blocking=True, timeout=5.0, purpose="test_waiter"):
+        open(acquired_flag, "w").close()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -78,6 +97,62 @@ def test_lock_reusable_after_release(tmp_path, monkeypatch):
     # Re-acquire must succeed now that the previous holder released
     with mine_palace_lock(palace):
         pass
+
+
+def test_palace_write_lock_single_acquire_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with palace_write_lock(str(tmp_path / "palace")) as resolved:
+        assert resolved.endswith("palace")
+
+
+def test_palace_write_lock_nonblocking_fails_when_held(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    with palace_write_lock(palace):
+        with pytest.raises(PalaceWriteLockTimeout):
+            with palace_write_lock(palace, blocking=False):
+                pytest.fail("second non-blocking acquire should fail")
+
+
+def test_palace_write_lock_timeout_when_held(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    with palace_write_lock(palace):
+        start = time.monotonic()
+        with pytest.raises(PalaceWriteLockTimeout):
+            with palace_write_lock(palace, blocking=True, timeout=0.05):
+                pytest.fail("blocking acquire should time out")
+        assert time.monotonic() - start < 1.0
+
+
+def test_palace_write_lock_uses_env_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", "0.05")
+    palace = str(tmp_path / "palace")
+    with palace_write_lock(palace):
+        start = time.monotonic()
+        with pytest.raises(PalaceWriteLockTimeout):
+            with palace_write_lock(palace, blocking=True):
+                pytest.fail("blocking acquire should use env timeout")
+        assert time.monotonic() - start < 1.0
+
+
+def test_palace_write_lock_conflicts_with_mine_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    with mine_palace_lock(palace):
+        with pytest.raises(PalaceWriteLockTimeout):
+            with palace_write_lock(palace, blocking=False):
+                pytest.fail("write lock should share mine lock key")
+
+
+def test_mine_palace_lock_still_raises_mine_already_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    with palace_write_lock(palace):
+        with pytest.raises(MineAlreadyRunning):
+            with mine_palace_lock(palace):
+                pytest.fail("mine wrapper should preserve MineAlreadyRunning")
 
 
 def test_same_palace_serializes_across_processes(tmp_path, monkeypatch):
@@ -106,6 +181,44 @@ def test_same_palace_serializes_across_processes(tmp_path, monkeypatch):
         open(release, "w").close()
         holder.join(timeout=5)
         assert holder.exitcode == 0
+
+
+def test_palace_write_lock_blocking_waits_across_processes(tmp_path, monkeypatch):
+    """Blocking mode must wait until the cross-process holder releases."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    ready = str(tmp_path / "ready_holder")
+    release = str(tmp_path / "release_holder")
+    started = str(tmp_path / "started_waiter")
+    acquired = str(tmp_path / "acquired_waiter")
+
+    ctx = _get_mp_context()
+    holder = ctx.Process(target=_hold_write_lock, args=(palace, ready, release))
+    waiter = ctx.Process(target=_blocking_write_lock_waiter, args=(palace, started, acquired))
+    holder.start()
+    try:
+        for _ in range(500):
+            if os.path.exists(ready):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(ready), "holder failed to acquire lock in time"
+
+        waiter.start()
+        for _ in range(500):
+            if os.path.exists(started):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(started), "waiter failed to start in time"
+        time.sleep(0.2)
+        assert not os.path.exists(acquired), "waiter acquired before holder released"
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=5)
+
+    waiter.join(timeout=5)
+    assert holder.exitcode == 0
+    assert waiter.exitcode == 0
+    assert os.path.exists(acquired), "waiter did not acquire after release"
 
 
 def test_different_palaces_dont_conflict(tmp_path, monkeypatch):
@@ -148,6 +261,19 @@ def test_palace_path_is_normalized(tmp_path, monkeypatch):
         with pytest.raises(MineAlreadyRunning):
             with mine_palace_lock(relative):
                 pytest.fail("normalized path collision should have raised")
+
+
+def test_palace_path_tilde_and_expanded_home_conflict(tmp_path, monkeypatch):
+    """Tilde and expanded-home forms of the same path must use one lock."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    os.makedirs(tmp_path / "palace", exist_ok=True)
+    tilde_form = os.path.join("~", "palace")
+    expanded = str(tmp_path / "palace")
+
+    with mine_palace_lock(tilde_form):
+        with pytest.raises(MineAlreadyRunning):
+            with mine_palace_lock(expanded):
+                pytest.fail("tilde path collision should have raised")
 
 
 def test_mine_global_lock_is_alias_for_back_compat(tmp_path, monkeypatch):

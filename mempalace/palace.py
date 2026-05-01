@@ -8,6 +8,8 @@ import contextlib
 import hashlib
 import os
 import re
+import time
+from typing import Optional
 
 from .backends.chroma import ChromaBackend
 
@@ -314,9 +316,39 @@ class MineAlreadyRunning(RuntimeError):
     """Raised when another `mempalace mine` already holds the per-palace lock."""
 
 
+class PalaceWriteLockTimeout(RuntimeError):
+    """Raised when a palace write lock cannot be acquired before timeout."""
+
+
+def _palace_write_lock_path(palace_path: str):
+    """Return the normalized palace path and shared write-lock file path."""
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    resolved = os.path.realpath(os.path.expanduser(palace_path))
+    lock_key_source = os.path.normcase(resolved)
+    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
+    lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+    return resolved, lock_path
+
+
+def _palace_lock_timeout() -> float:
+    """Return the MCP write-lock timeout from env, falling back to 60 seconds."""
+    try:
+        timeout = float(os.environ.get("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", "60"))
+    except (TypeError, ValueError):
+        timeout = 60.0
+    return max(0.0, timeout)
+
+
 @contextlib.contextmanager
-def mine_palace_lock(palace_path: str):
-    """Per-palace non-blocking lock around the full `mine` pipeline.
+def palace_write_lock(
+    palace_path: str,
+    *,
+    blocking: bool = False,
+    timeout: Optional[float] = None,
+    purpose: str = "write",
+):
+    """Per-palace write lock shared by mining and MCP mutating tools.
 
     The per-file `mine_lock` only protects delete+insert interleave for a
     single source; it does not prevent N copies of `mempalace mine <dir>`
@@ -326,7 +358,7 @@ def mine_palace_lock(palace_path: str):
     corrupt the HNSW graph and produce sparse link_lists.bin blowups.
 
     The lock file is keyed by sha256(palace_path) so mines against
-    *different* palaces can still run in parallel — we only serialize
+    *different* palaces can still run in parallel - we only serialize
     writes into the same palace, which is the correctness boundary.
 
     The key is derived from a fully normalized form of the path:
@@ -335,47 +367,75 @@ def mine_palace_lock(palace_path: str):
     normcase, `C:\\Palace` and `c:\\palace` would hash to different keys
     on Windows and let two concurrent mines touch the same on-disk palace.
 
-    Non-blocking: if another `mine` is already writing to this palace,
-    raise MineAlreadyRunning so the caller can exit cleanly instead of
-    piling up as a waiting worker.
+    Non-blocking mode raises PalaceWriteLockTimeout immediately when the
+    lock is held. Blocking mode polls with a short sleep until `timeout`
+    expires. A `None` timeout uses MEMPALACE_MCP_WRITE_LOCK_TIMEOUT, with
+    a 60 second fallback.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
-    resolved = os.path.realpath(os.path.expanduser(palace_path))
-    lock_key_source = os.path.normcase(resolved)
-    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
-    lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+    if timeout is None:
+        timeout = _palace_lock_timeout()
+    else:
+        timeout = max(0.0, float(timeout))
 
-    lf = open(lock_path, "w")
+    resolved, lock_path = _palace_write_lock_path(palace_path)
+    lf = open(lock_path, "a+", encoding="utf-8")
     acquired = False
-    try:
+
+    def _try_acquire() -> bool:
         if os.name == "nt":
             import msvcrt
 
             try:
+                lf.seek(0)
                 msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
-            except OSError as exc:
-                raise MineAlreadyRunning(
-                    f"another `mempalace mine` is already running against {resolved}"
-                ) from exc
-        else:
-            import fcntl
+                return True
+            except OSError:
+                return False
 
-            try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        import fcntl
+
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    try:
+        if blocking:
+            deadline = time.monotonic() + timeout
+            while True:
+                if _try_acquire():
+                    acquired = True
+                    break
+                if time.monotonic() >= deadline:
+                    raise PalaceWriteLockTimeout(
+                        f"palace write lock timeout ({timeout:.3f}s) for {resolved}"
+                    )
+                time.sleep(0.05)
+        else:
+            if _try_acquire():
                 acquired = True
-            except BlockingIOError as exc:
-                raise MineAlreadyRunning(
-                    f"another `mempalace mine` is already running against {resolved}"
-                ) from exc
-        yield
+            else:
+                raise PalaceWriteLockTimeout(
+                    f"palace write lock held by another process for {resolved}"
+                )
+
+        try:
+            lf.seek(0)
+            lf.truncate()
+            lf.write(f"{purpose}\n")
+            lf.flush()
+        except OSError:
+            pass
+
+        yield resolved
     finally:
         if acquired:
             try:
                 if os.name == "nt":
                     import msvcrt
 
+                    lf.seek(0)
                     msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     import fcntl
@@ -384,6 +444,29 @@ def mine_palace_lock(palace_path: str):
             except Exception:
                 pass
         lf.close()
+
+
+@contextlib.contextmanager
+def mine_palace_lock(palace_path: str):
+    """Per-palace non-blocking lock around the full `mine` pipeline.
+
+    The lock is shared with MCP mutating tools, so `mempalace mine` and MCP
+    writes cannot interleave ChromaDB writes for the same palace. If any
+    writer already holds the lock, raise MineAlreadyRunning so the caller can
+    exit cleanly instead of piling up as a waiting worker.
+    """
+    acquired = False
+    try:
+        with palace_write_lock(palace_path, blocking=False, purpose="mine") as resolved:
+            acquired = True
+            yield resolved
+    except PalaceWriteLockTimeout as exc:
+        if acquired:
+            raise
+        resolved, _lock_path = _palace_write_lock_path(palace_path)
+        raise MineAlreadyRunning(
+            f"another process is already writing to palace {resolved}"
+        ) from exc
 
 
 # Backward-compatible alias (previous patch iteration used a single global
