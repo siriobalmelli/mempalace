@@ -52,6 +52,7 @@ from pathlib import Path  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
+    resolve_palace_path,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
@@ -68,11 +69,13 @@ from .backends.chroma import (  # noqa: E402
 )
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
+from .palace import palace_write_lock, PalaceWriteLockTimeout  # noqa: E402
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
     graph_stats,
     create_tunnel,
+    invalidate_graph_cache,
     list_tunnels,
     delete_tunnel,
     follow_tunnels,
@@ -100,15 +103,104 @@ def _parse_args():
 _args = _parse_args()
 
 if _args.palace:
-    os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(_args.palace)
+    os.environ["MEMPALACE_PALACE_PATH"] = resolve_palace_path(_args.palace)
 
 _config = MempalaceConfig()
-# Only override KG path when --palace is explicitly provided; otherwise use
-# KnowledgeGraph's default (~/.mempalace/knowledge_graph.sqlite3).
-if _args.palace:
-    _kg = KnowledgeGraph(db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3"))
-else:
-    _kg = KnowledgeGraph()
+
+
+def _remove_sqlite_sidecars(db_path: str) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(db_path + suffix)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.debug("Could not remove temporary SQLite file %s", db_path + suffix)
+
+
+def _migrate_legacy_kg(palace_path: str) -> str:
+    """Return the selected palace KG path, copying legacy KG there if needed.
+
+    The selected palace is authoritative. If a legacy
+    ~/.mempalace/knowledge_graph.sqlite3 exists and the selected palace has
+    no KG yet, copy the legacy DB into the palace with sqlite3.backup(). The
+    legacy DB is preserved. We never fall back to the legacy path, because
+    that recreates split-brain state for env/config-selected palaces.
+    """
+    target = os.path.join(palace_path, "knowledge_graph.sqlite3")
+    if os.path.isfile(target):
+        return target
+
+    legacy = os.path.join(os.path.expanduser("~"), ".mempalace", "knowledge_graph.sqlite3")
+    if not os.path.isfile(legacy):
+        return target
+
+    if os.path.normcase(os.path.realpath(legacy)) == os.path.normcase(os.path.realpath(target)):
+        return target
+
+    try:
+        # Do not use the MCP write timeout here. Returning an absent target after
+        # timeout would let KnowledgeGraph create an empty DB while another
+        # process is still migrating the legacy KG into the selected palace.
+        with palace_write_lock(
+            palace_path, blocking=True, timeout=float("inf"), purpose="kg_migration"
+        ):
+            if os.path.isfile(target) or not os.path.isfile(legacy):
+                return target
+
+            tmp_target = target + ".migrating"
+            src_conn = None
+            dst_conn = None
+            cleanup_tmp = False
+            try:
+                import sqlite3
+
+                os.makedirs(palace_path, exist_ok=True)
+                _remove_sqlite_sidecars(tmp_target)
+                src_conn = sqlite3.connect(f"file:{legacy}?mode=ro", uri=True)
+                dst_conn = sqlite3.connect(tmp_target)
+                src_conn.backup(dst_conn)
+                dst_conn.close()
+                dst_conn = None
+                src_conn.close()
+                src_conn = None
+                os.replace(tmp_target, target)
+                for suffix in ("-wal", "-shm"):
+                    try:
+                        os.unlink(tmp_target + suffix)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        logger.debug(
+                            "Could not remove temporary SQLite sidecar %s", tmp_target + suffix
+                        )
+                logger.warning(
+                    "Migrated legacy knowledge graph from %s to %s; original preserved",
+                    legacy,
+                    target,
+                )
+            except Exception:
+                logger.exception("Legacy knowledge graph migration failed; using %s", target)
+                cleanup_tmp = True
+            finally:
+                if dst_conn is not None:
+                    try:
+                        dst_conn.close()
+                    except Exception:
+                        pass
+                if src_conn is not None:
+                    try:
+                        src_conn.close()
+                    except Exception:
+                        pass
+                if cleanup_tmp:
+                    _remove_sqlite_sidecars(tmp_target)
+    except PalaceWriteLockTimeout:
+        logger.exception("Timed out waiting to migrate legacy knowledge graph; using %s", target)
+    return target
+
+
+_kg = KnowledgeGraph(db_path=_migrate_legacy_kg(_config.palace_path))
 
 
 _client_cache = None
@@ -205,6 +297,7 @@ def _wal_log(operation: str, params: dict, result: dict = None):
     entry = {
         "timestamp": datetime.now().isoformat(),
         "operation": operation,
+        "palace_path": _config.palace_path,
         "params": safe_params,
         "result": result,
     }
@@ -393,6 +486,15 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     if value is None or not value.strip():
         return None
     return sanitize_name(value, field_name)
+
+
+def _write_lock_timeout_result(exc: Exception) -> dict:
+    return {
+        "success": False,
+        "error": "palace write lock timeout",
+        "palace_path": _config.palace_path,
+        "detail": str(exc),
+    }
 
 
 # ==================== READ TOOLS ====================
@@ -820,52 +922,60 @@ def tool_add_drawer(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    col = _get_collection(create=True)
-    if not col:
-        return _no_palace()
-
     drawer_id = (
         f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
     )
 
-    _wal_log(
-        "add_drawer",
-        {
-            "drawer_id": drawer_id,
-            "wing": wing,
-            "room": room,
-            "added_by": added_by,
-            "content_length": len(content),
-            "content_preview": content[:200],
-        },
-    )
-
-    # Idempotency: if the deterministic ID already exists, return success as a no-op.
     try:
-        existing = col.get(ids=[drawer_id])
-        if existing and existing["ids"]:
-            return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
-    except Exception:
-        pass
+        with palace_write_lock(_config.palace_path, blocking=True, purpose="add_drawer"):
+            col = _get_collection(create=True)
+            if not col:
+                return _no_palace()
 
-    try:
-        col.upsert(
-            ids=[drawer_id],
-            documents=[content],
-            metadatas=[
+            # Idempotency: re-read inside the lock so two MCP writers cannot
+            # both observe absence before one writes the deterministic ID.
+            try:
+                existing = col.get(ids=[drawer_id])
+                if existing and existing["ids"]:
+                    return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            except Exception:
+                pass
+
+            _wal_log(
+                "add_drawer",
                 {
+                    "drawer_id": drawer_id,
                     "wing": wing,
                     "room": room,
-                    "source_file": source_file or "",
-                    "chunk_index": 0,
                     "added_by": added_by,
-                    "filed_at": datetime.now().isoformat(),
-                }
-            ],
-        )
-        _metadata_cache = None
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+                    "content_length": len(content),
+                    "content_preview": content[:200],
+                },
+            )
+
+            try:
+                col.upsert(
+                    ids=[drawer_id],
+                    documents=[content],
+                    metadatas=[
+                        {
+                            "wing": wing,
+                            "room": room,
+                            "source_file": source_file or "",
+                            "chunk_index": 0,
+                            "added_by": added_by,
+                            "filed_at": datetime.now().isoformat(),
+                        }
+                    ],
+                )
+                _metadata_cache = None
+                invalidate_graph_cache()
+                logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
+                return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+    except PalaceWriteLockTimeout as exc:
+        return _write_lock_timeout_result(exc)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -873,32 +983,42 @@ def tool_add_drawer(
 def tool_delete_drawer(drawer_id: str):
     """Delete a single drawer by ID."""
     global _metadata_cache
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    existing = col.get(ids=[drawer_id])
-    if not existing["ids"]:
-        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
-
-    # Log the deletion with the content being removed for audit trail
-    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    _wal_log(
-        "delete_drawer",
-        {
-            "drawer_id": drawer_id,
-            "deleted_meta": deleted_meta,
-            "content_preview": deleted_content[:200],
-        },
-    )
+    if not drawer_id or not isinstance(drawer_id, str):
+        return {"success": False, "error": "drawer_id is required"}
 
     try:
-        col.delete(ids=[drawer_id])
-        _metadata_cache = None
-        logger.info(f"Deleted drawer: {drawer_id}")
-        return {"success": True, "drawer_id": drawer_id}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        with palace_write_lock(_config.palace_path, blocking=True, purpose="delete_drawer"):
+            col = _get_collection()
+            if not col:
+                return _no_palace()
+            existing = col.get(ids=[drawer_id])
+            if not existing["ids"]:
+                return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+
+            # Log the deletion with the content being removed for audit trail.
+            deleted_content = (
+                existing.get("documents", [""])[0] if existing.get("documents") else ""
+            )
+            deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+            _wal_log(
+                "delete_drawer",
+                {
+                    "drawer_id": drawer_id,
+                    "deleted_meta": deleted_meta,
+                    "content_preview": deleted_content[:200],
+                },
+            )
+
+            try:
+                col.delete(ids=[drawer_id])
+                _metadata_cache = None
+                invalidate_graph_cache()
+                logger.info(f"Deleted drawer: {drawer_id}")
+                return {"success": True, "drawer_id": drawer_id}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+    except PalaceWriteLockTimeout as exc:
+        return _write_lock_timeout_result(exc)
 
 
 def tool_get_drawer(drawer_id: str):
@@ -987,67 +1107,81 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
     """Update an existing drawer's content and/or metadata."""
     global _metadata_cache
 
+    if not drawer_id or not isinstance(drawer_id, str):
+        return {"success": False, "error": "drawer_id is required"}
+
     if content is None and wing is None and room is None:
         return {"success": True, "drawer_id": drawer_id, "noop": True}
 
-    col = _get_collection()
-    if not col:
-        return _no_palace()
+    if content is not None:
+        try:
+            content = sanitize_content(content)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+    if wing is not None:
+        try:
+            wing = sanitize_name(wing, "wing")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+    if room is not None:
+        try:
+            room = sanitize_name(room, "room")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
     try:
-        existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
-        if not existing["ids"]:
-            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+        with palace_write_lock(_config.palace_path, blocking=True, purpose="update_drawer"):
+            col = _get_collection()
+            if not col:
+                return _no_palace()
+            existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
+            if not existing["ids"]:
+                return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-        old_meta = existing["metadatas"][0]
-        old_doc = existing["documents"][0]
+            old_meta = existing["metadatas"][0]
+            old_doc = existing["documents"][0]
 
-        new_doc = old_doc
-        if content is not None:
+            new_doc = content if content is not None else old_doc
+            new_meta = dict(old_meta)
+            if wing is not None:
+                new_meta["wing"] = wing
+            if room is not None:
+                new_meta["room"] = room
+
+            _wal_log(
+                "update_drawer",
+                {
+                    "drawer_id": drawer_id,
+                    "old_wing": old_meta.get("wing", ""),
+                    "old_room": old_meta.get("room", ""),
+                    "new_wing": new_meta.get("wing", ""),
+                    "new_room": new_meta.get("room", ""),
+                    "content_changed": content is not None,
+                    "content_preview": new_doc[:200] if content is not None else None,
+                },
+            )
+
             try:
-                new_doc = sanitize_content(content)
-            except ValueError as e:
+                update_kwargs = {"ids": [drawer_id]}
+                if content is not None:
+                    update_kwargs["documents"] = [new_doc]
+                update_kwargs["metadatas"] = [new_meta]
+                col.update(**update_kwargs)
+
+                _metadata_cache = None
+                invalidate_graph_cache()
+
+                logger.info(f"Updated drawer: {drawer_id}")
+                return {
+                    "success": True,
+                    "drawer_id": drawer_id,
+                    "wing": new_meta.get("wing", ""),
+                    "room": new_meta.get("room", ""),
+                }
+            except Exception as e:
                 return {"success": False, "error": str(e)}
-
-        new_meta = dict(old_meta)
-        if wing is not None:
-            try:
-                new_meta["wing"] = sanitize_name(wing, "wing")
-            except ValueError as e:
-                return {"success": False, "error": str(e)}
-        if room is not None:
-            try:
-                new_meta["room"] = sanitize_name(room, "room")
-            except ValueError as e:
-                return {"success": False, "error": str(e)}
-
-        _wal_log(
-            "update_drawer",
-            {
-                "drawer_id": drawer_id,
-                "old_wing": old_meta.get("wing", ""),
-                "old_room": old_meta.get("room", ""),
-                "new_wing": new_meta.get("wing", ""),
-                "new_room": new_meta.get("room", ""),
-                "content_changed": content is not None,
-                "content_preview": new_doc[:200] if content is not None else None,
-            },
-        )
-
-        update_kwargs = {"ids": [drawer_id]}
-        if content is not None:
-            update_kwargs["documents"] = [new_doc]
-        update_kwargs["metadatas"] = [new_meta]
-        col.update(**update_kwargs)
-
-        _metadata_cache = None
-
-        logger.info(f"Updated drawer: {drawer_id}")
-        return {
-            "success": True,
-            "drawer_id": drawer_id,
-            "wing": new_meta.get("wing", ""),
-            "room": new_meta.get("room", ""),
-        }
+    except PalaceWriteLockTimeout as exc:
+        return _write_lock_timeout_result(exc)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1095,30 +1229,38 @@ def tool_kg_add(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    _wal_log(
-        "kg_add",
-        {
-            "subject": subject,
-            "predicate": predicate,
-            "object": object,
-            "valid_from": valid_from,
-            "valid_to": valid_to,
-            "source_closet": source_closet,
-            "source_file": source_file,
-            "source_drawer_id": source_drawer_id,
-        },
-    )
-    triple_id = _kg.add_triple(
-        subject,
-        predicate,
-        object,
-        valid_from=valid_from,
-        valid_to=valid_to,
-        source_closet=source_closet,
-        source_file=source_file,
-        source_drawer_id=source_drawer_id,
-    )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+    try:
+        with palace_write_lock(_config.palace_path, blocking=True, purpose="kg_add"):
+            _wal_log(
+                "kg_add",
+                {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": object,
+                    "valid_from": valid_from,
+                    "valid_to": valid_to,
+                    "source_closet": source_closet,
+                    "source_file": source_file,
+                    "source_drawer_id": source_drawer_id,
+                },
+            )
+            triple_id = _kg.add_triple(
+                subject,
+                predicate,
+                object,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                source_closet=source_closet,
+                source_file=source_file,
+                source_drawer_id=source_drawer_id,
+            )
+            return {
+                "success": True,
+                "triple_id": triple_id,
+                "fact": f"{subject} -> {predicate} -> {object}",
+            }
+    except PalaceWriteLockTimeout as exc:
+        return _write_lock_timeout_result(exc)
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -1137,22 +1279,26 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
         object = sanitize_kg_value(object, "object")
     except ValueError as e:
         return {"success": False, "error": str(e)}
-    resolved_ended = ended or date.today().isoformat()
-    _wal_log(
-        "kg_invalidate",
-        {
-            "subject": subject,
-            "predicate": predicate,
-            "object": object,
-            "ended": resolved_ended,
-        },
-    )
-    _kg.invalidate(subject, predicate, object, ended=resolved_ended)
-    return {
-        "success": True,
-        "fact": f"{subject} → {predicate} → {object}",
-        "ended": resolved_ended,
-    }
+    try:
+        with palace_write_lock(_config.palace_path, blocking=True, purpose="kg_invalidate"):
+            resolved_ended = ended or date.today().isoformat()
+            _wal_log(
+                "kg_invalidate",
+                {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": object,
+                    "ended": resolved_ended,
+                },
+            )
+            _kg.invalidate(subject, predicate, object, ended=resolved_ended)
+            return {
+                "success": True,
+                "fact": f"{subject} -> {predicate} -> {object}",
+                "ended": resolved_ended,
+            }
+    except PalaceWriteLockTimeout as exc:
+        return _write_lock_timeout_result(exc)
 
 
 def tool_kg_timeline(entity: str = None):
@@ -1186,6 +1332,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
     """
+    global _metadata_cache
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
@@ -1194,13 +1341,13 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return {"success": False, "error": str(e)}
 
     if wing:
-        wing = sanitize_name(wing)
+        try:
+            wing = sanitize_name(wing)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
     else:
         wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
-    col = _get_collection(create=True)
-    if not col:
-        return _no_palace()
 
     now = datetime.now()
     entry_id = (
@@ -1208,47 +1355,57 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
     )
 
-    _wal_log(
-        "diary_write",
-        {
-            "agent_name": agent_name,
-            "topic": topic,
-            "entry_id": entry_id,
-            "entry_preview": entry[:200],
-        },
-    )
-
     try:
-        # TODO: Future versions should expand AAAK before embedding to improve
-        # semantic search quality. For now, store raw AAAK in metadata so it's
-        # preserved, and keep the document as-is for embedding (even though
-        # compressed AAAK degrades embedding quality).
-        col.add(
-            ids=[entry_id],
-            documents=[entry],
-            metadatas=[
+        with palace_write_lock(_config.palace_path, blocking=True, purpose="diary_write"):
+            col = _get_collection(create=True)
+            if not col:
+                return _no_palace()
+
+            _wal_log(
+                "diary_write",
                 {
-                    "wing": wing,
-                    "room": room,
-                    "hall": "hall_diary",
+                    "agent_name": agent_name,
                     "topic": topic,
-                    "type": "diary_entry",
+                    "entry_id": entry_id,
+                    "entry_preview": entry[:200],
+                },
+            )
+
+            try:
+                # TODO: Future versions should expand AAAK before embedding to improve
+                # semantic search quality. For now, store raw AAAK in metadata so it's
+                # preserved, and keep the document as-is for embedding (even though
+                # compressed AAAK degrades embedding quality).
+                col.add(
+                    ids=[entry_id],
+                    documents=[entry],
+                    metadatas=[
+                        {
+                            "wing": wing,
+                            "room": room,
+                            "hall": "hall_diary",
+                            "topic": topic,
+                            "type": "diary_entry",
+                            "agent": agent_name,
+                            "filed_at": now.isoformat(),
+                            "date": now.strftime("%Y-%m-%d"),
+                        }
+                    ],
+                )
+                _metadata_cache = None
+                invalidate_graph_cache()
+                logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
+                return {
+                    "success": True,
+                    "entry_id": entry_id,
                     "agent": agent_name,
-                    "filed_at": now.isoformat(),
-                    "date": now.strftime("%Y-%m-%d"),
+                    "topic": topic,
+                    "timestamp": now.isoformat(),
                 }
-            ],
-        )
-        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
-        return {
-            "success": True,
-            "entry_id": entry_id,
-            "agent": agent_name,
-            "topic": topic,
-            "timestamp": now.isoformat(),
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+    except PalaceWriteLockTimeout as exc:
+        return _write_lock_timeout_result(exc)
 
 
 def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):

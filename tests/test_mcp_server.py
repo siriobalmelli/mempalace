@@ -8,7 +8,13 @@ via monkeypatch to avoid touching real data.
 
 from datetime import datetime
 import json
+import multiprocessing
+import os
+import queue
+import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -36,6 +42,52 @@ def _get_collection(palace_path, create=False):
             client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"}),
         )
     return client, client.get_collection("mempalace_drawers")
+
+
+def _get_mp_context():
+    return multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
+
+
+def _hold_palace_write_lock_process(palace_path: str, home: str, ready: str, release: str):
+    os.environ["HOME"] = home
+    os.environ["USERPROFILE"] = home
+    from mempalace.palace import palace_write_lock
+
+    with palace_write_lock(palace_path, blocking=True, timeout=5.0, purpose="mcp_test_holder"):
+        open(ready, "w").close()
+        for _ in range(1000):
+            if os.path.exists(release):
+                return
+            time.sleep(0.01)
+
+
+def _mcp_add_drawer_process(palace_path: str, home: str, started: str, result_queue):
+    os.environ["HOME"] = home
+    os.environ["USERPROFILE"] = home
+    os.environ["MEMPALACE_PALACE_PATH"] = palace_path
+    os.environ["MEMPALACE_MCP_WRITE_LOCK_TIMEOUT"] = "5"
+    from mempalace.mcp_server import tool_add_drawer
+
+    open(started, "w").close()
+    try:
+        result_queue.put(
+            tool_add_drawer(
+                wing="integration",
+                room="locks",
+                content="cross process mcp write lock integration drawer",
+            )
+        )
+    except Exception as exc:
+        result_queue.put({"success": False, "error": repr(exc)})
+
+
+def _wait_for_file(path: str, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.01)
+    return os.path.exists(path)
 
 
 # ── Protocol Layer ──────────────────────────────────────────────────────
@@ -116,6 +168,34 @@ class TestHandleRequest:
         assert "mempalace_search" in names
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
+
+    def test_palace_arg_expands_tilde_in_subprocess(self, tmp_path):
+        """Import-time --palace handling must not preserve a literal tilde."""
+        home = tmp_path / "home"
+        home.mkdir()
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
+        proc = subprocess.run(
+            [sys.executable, "-m", "mempalace.mcp_server", "--palace", "~/mempalace-smoke"],
+            input=(
+                '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+                '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mempalace_add_drawer","arguments":{"wing":"smoke","room":"general","content":"tilde palace smoke drawer"}}}\n'
+                '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mempalace_status","arguments":{}}}\n'
+            ),
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        responses = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        status = responses[-1]
+        body = json.loads(status["result"]["content"][0]["text"])
+        assert "palace_path" not in body
+        assert (home / "mempalace-smoke" / "chroma.sqlite3").exists()
+        assert not (home / "~" / "mempalace-smoke").exists()
 
     def test_null_arguments_does_not_hang(self, monkeypatch, config, palace_path, seeded_kg):
         """Sending arguments: null should return a result, not hang (#394)."""
@@ -418,9 +498,46 @@ class TestSearchTool:
         )
 
         entry = json.loads(wal_file.read_text().strip())
+        assert entry["palace_path"] == config.palace_path
         assert entry["params"]["content"].startswith("[REDACTED")
         assert entry["params"]["query"].startswith("[REDACTED")
         assert entry["params"]["safe"] == "ok"
+
+    def test_wal_includes_palace_path(self, monkeypatch, config, kg, tmp_path):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        wal_file = tmp_path / "write_log.jsonl"
+        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+
+        mcp_server._wal_log("test", {"safe": "ok"})
+
+        entry = json.loads(wal_file.read_text().strip())
+        assert entry["palace_path"] == config.palace_path
+        assert entry["params"] == {"safe": "ok"}
+
+    def test_wal_concurrent_entries_are_valid_jsonl(self, monkeypatch, config, kg, tmp_path):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        wal_file = tmp_path / "write_log.jsonl"
+        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+
+        def write_entry(i):
+            mcp_server._wal_log("test", {"safe": i, "content": f"secret-{i}"})
+
+        threads = [threading.Thread(target=write_entry, args=(i,)) for i in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        lines = wal_file.read_text().splitlines()
+        assert len(lines) == 20
+        for line in lines:
+            entry = json.loads(line)
+            assert entry["palace_path"] == config.palace_path
+            assert entry["params"]["content"].startswith("[REDACTED")
 
 
 # ── Write Tools ─────────────────────────────────────────────────────────
@@ -653,6 +770,126 @@ class TestWriteTools:
         result = tool_update_drawer("drawer_proj_backend_aaa")
         assert result["success"] is True
         assert result.get("noop") is True
+
+    def test_write_lock_timeout_returns_structured_error(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        """Direct write tool calls must return JSON-safe lock timeout errors."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        monkeypatch.setenv("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", "0.05")
+        from mempalace import mcp_server
+
+        ctx = _get_mp_context()
+        ready = str(tmp_path / "holder-ready")
+        release = str(tmp_path / "holder-release")
+        holder = ctx.Process(
+            target=_hold_palace_write_lock_process,
+            args=(config.palace_path, os.environ["HOME"], ready, release),
+        )
+        holder.start()
+        try:
+            assert _wait_for_file(ready), "holder did not acquire lock"
+            result = mcp_server.tool_add_drawer(wing="w", room="r", content="blocked write")
+            assert result["success"] is False
+            assert result["error"] == "palace write lock timeout"
+            assert result["palace_path"] == config.palace_path
+        finally:
+            open(release, "w").close()
+            holder.join(timeout=5)
+        assert holder.exitcode == 0
+
+    def test_handle_request_lock_timeout_is_tool_result(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        """JSON-RPC stays valid when a mutating tool cannot acquire the lock."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        monkeypatch.setenv("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", "0.05")
+        from mempalace.mcp_server import handle_request
+
+        ctx = _get_mp_context()
+        ready = str(tmp_path / "holder-ready-rpc")
+        release = str(tmp_path / "holder-release-rpc")
+        holder = ctx.Process(
+            target=_hold_palace_write_lock_process,
+            args=(config.palace_path, os.environ["HOME"], ready, release),
+        )
+        holder.start()
+        try:
+            assert _wait_for_file(ready), "holder did not acquire lock"
+            resp = handle_request(
+                {
+                    "method": "tools/call",
+                    "id": 99,
+                    "params": {
+                        "name": "mempalace_add_drawer",
+                        "arguments": {"wing": "w", "room": "r", "content": "blocked write"},
+                    },
+                }
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["success"] is False
+            assert body["error"] == "palace write lock timeout"
+        finally:
+            open(release, "w").close()
+            holder.join(timeout=5)
+        assert holder.exitcode == 0
+
+    def test_read_tool_not_blocked_by_external_write_lock(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        """Read-only tools must not acquire or wait on the write lock."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_status
+
+        ctx = _get_mp_context()
+        ready = str(tmp_path / "holder-ready-read")
+        release = str(tmp_path / "holder-release-read")
+        holder = ctx.Process(
+            target=_hold_palace_write_lock_process,
+            args=(config.palace_path, os.environ["HOME"], ready, release),
+        )
+        holder.start()
+        try:
+            assert _wait_for_file(ready), "holder did not acquire lock"
+            result = tool_status()
+            assert "palace write lock timeout" not in json.dumps(result)
+        finally:
+            open(release, "w").close()
+            holder.join(timeout=5)
+        assert holder.exitcode == 0
+
+    def test_mcp_write_waits_for_cross_process_lock(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        """A real MCP write must wait behind a held palace write lock."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.palace import palace_write_lock
+
+        ctx = _get_mp_context()
+        started = str(tmp_path / "mcp-writer-started")
+        result_queue = ctx.Queue()
+        writer = ctx.Process(
+            target=_mcp_add_drawer_process,
+            args=(config.palace_path, os.environ["HOME"], started, result_queue),
+        )
+
+        with palace_write_lock(config.palace_path, blocking=True, timeout=1.0):
+            writer.start()
+            assert _wait_for_file(started, timeout=10.0), "writer did not reach tool call"
+            with pytest.raises(queue.Empty):
+                result_queue.get(timeout=0.3)
+
+        writer.join(timeout=20)
+        assert writer.exitcode == 0
+        result = result_queue.get(timeout=1)
+        assert result["success"] is True
+
+        client, col = _get_collection(palace_path, create=False)
+        stored = col.get(ids=[result["drawer_id"]])
+        del client
+        assert stored["ids"] == [result["drawer_id"]]
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────

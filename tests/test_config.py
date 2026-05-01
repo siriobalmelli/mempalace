@@ -3,7 +3,13 @@ import json
 import tempfile
 
 import pytest
-from mempalace.config import MempalaceConfig, normalize_wing_name, sanitize_kg_value, sanitize_name
+from mempalace.config import (
+    MempalaceConfig,
+    normalize_wing_name,
+    resolve_palace_path,
+    sanitize_kg_value,
+    sanitize_name,
+)
 
 
 def test_default_config():
@@ -14,10 +20,36 @@ def test_default_config():
 
 def test_config_from_file():
     tmpdir = tempfile.mkdtemp()
+    raw = "/custom/palace"
     with open(os.path.join(tmpdir, "config.json"), "w") as f:
-        json.dump({"palace_path": "/custom/palace"}, f)
+        json.dump({"palace_path": raw}, f)
     cfg = MempalaceConfig(config_dir=tmpdir)
-    assert cfg.palace_path == "/custom/palace"
+    assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
+
+
+def test_config_from_file_normalizes_tilde_path(tmp_path):
+    raw = os.path.join("~", "custom-palace")
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"palace_path": raw}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
+
+
+def test_resolve_palace_path_expands_tilde():
+    raw = os.path.join("~", "mempalace-test")
+    assert resolve_palace_path(raw) == os.path.abspath(os.path.expanduser(raw))
+
+
+def test_resolve_palace_path_collapses_traversal(tmp_path):
+    raw = os.path.join(str(tmp_path), "palace", "..", "mempalace-test")
+    result = resolve_palace_path(raw)
+    assert result == os.path.abspath(os.path.expanduser(raw))
+    assert ".." not in result
+
+
+def test_resolve_palace_path_absolute_passthrough(tmp_path):
+    raw = str(tmp_path / "absolute-palace")
+    assert resolve_palace_path(raw) == os.path.abspath(raw)
 
 
 def test_embedding_device_defaults_to_auto(monkeypatch):

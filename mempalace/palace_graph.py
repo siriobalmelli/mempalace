@@ -69,6 +69,8 @@ def invalidate_graph_cache():
 
 def _get_collection(config=None):
     config = config or MempalaceConfig()
+    if not os.path.isfile(os.path.join(config.palace_path, "chroma.sqlite3")):
+        return None
     try:
         return _get_palace_collection(
             config.palace_path,
@@ -333,6 +335,10 @@ def _fuzzy_match(query: str, nodes: dict, n: int = 5):
 
 
 _TUNNEL_FILE = os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
+# TODO: Move explicit tunnels to a palace-scoped path such as
+# <palace>/.mempalace/tunnels.json. The current global file remains protected
+# by mine_lock(_TUNNEL_FILE), so concurrent tunnel writes do not lose updates,
+# but tunnels are not yet isolated by selected palace.
 
 
 def _load_tunnels():
