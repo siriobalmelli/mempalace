@@ -1,6 +1,7 @@
 """Tests for mempalace.entity_registry."""
 
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 
 from mempalace.entity_registry import (
     COMMON_ENGLISH_WORDS,
@@ -49,6 +50,17 @@ def test_load_from_nonexistent_dir(tmp_path):
     assert registry.projects == []
     assert registry.mode == "personal"
     assert registry.ambiguous_flags == []
+
+
+def test_load_from_corrupt_file_falls_back_to_empty_state(tmp_path):
+    config_file = tmp_path / "entity_registry.json"
+    config_file.write_text("{ not json", encoding="utf-8")
+
+    registry = EntityRegistry.load(config_dir=tmp_path)
+
+    assert registry.people == {}
+    assert registry.projects == []
+    assert registry.mode == "personal"
 
 
 def test_save_and_load_roundtrip(tmp_path):
@@ -221,6 +233,17 @@ def test_lookup_ambiguous_word_as_concept(tmp_path):
     assert result["type"] == "concept"
 
 
+def test_lookup_ambiguous_word_tie_falls_back_to_person(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.seed(
+        mode="personal",
+        people=[{"name": "Ever", "relationship": "friend", "context": "personal"}],
+        projects=[],
+    )
+    result = registry.lookup("Ever", context="I said ever")
+    assert result["type"] == "person"
+
+
 # ── research — local-only by default ───────────────────────────────────
 
 
@@ -273,6 +296,85 @@ def test_research_caches_result(tmp_path):
     ):
         cached = registry.research("Saoirse")
     assert cached["inferred_type"] == "person"
+
+
+def test_wikipedia_lookup_disambiguation_name(tmp_path):
+    payload = {
+        "type": "disambiguation",
+        "description": "A name shared by several famous people",
+        "extract": "Saoirse is a well known Irish name.",
+        "title": "Saoirse",
+    }
+
+    response = MagicMock()
+    response.read.return_value = json.dumps(payload).encode()
+    response.__enter__.return_value = response
+
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with patch("mempalace.entity_registry.urllib.request.urlopen", return_value=response):
+        result = registry.research("Saoirse", auto_confirm=True, allow_network=True)
+
+    assert result["inferred_type"] == "person"
+    assert result["confirmed"] is True
+    assert result["confidence"] == 0.65
+
+
+def test_wikipedia_lookup_place_and_concept(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+
+    place_payload = {
+        "type": "standard",
+        "extract": "Saoirse is a city in a river valley.",
+        "title": "Saoirse",
+    }
+    place_response = MagicMock()
+    place_response.read.return_value = json.dumps(place_payload).encode()
+    place_response.__enter__.return_value = place_response
+
+    concept_payload = {
+        "type": "standard",
+        "extract": "A conceptual framework for language models.",
+        "title": "Xylophone",
+    }
+    concept_response = MagicMock()
+    concept_response.read.return_value = json.dumps(concept_payload).encode()
+    concept_response.__enter__.return_value = concept_response
+
+    with patch(
+        "mempalace.entity_registry.urllib.request.urlopen",
+        side_effect=[place_response, concept_response],
+    ):
+        place_result = registry.research("Saoirse", auto_confirm=True, allow_network=True)
+        concept_result = registry.research("Xylophone", auto_confirm=True, allow_network=True)
+
+    assert place_result["inferred_type"] == "place"
+    assert concept_result["inferred_type"] == "concept"
+
+
+def test_wikipedia_lookup_http_error_code(tmp_path):
+    from urllib.error import HTTPError
+
+    def _raise_http_error(*_args, **_kwargs):
+        raise HTTPError("https://en.wikipedia.org", 404, "not found", None, None)
+
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with patch("mempalace.entity_registry.urllib.request.urlopen", side_effect=_raise_http_error):
+        result = registry.research("MissingWord", auto_confirm=True, allow_network=True)
+
+    assert result["inferred_type"] == "unknown"
+    assert result["confidence"] == 0.3
+    assert result.get("note") == "not found in Wikipedia"
+
+
+def test_wikipedia_lookup_non_http_error_returns_unknown(tmp_path):
+    from urllib.error import URLError
+
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with patch("mempalace.entity_registry.urllib.request.urlopen", side_effect=URLError("boom")):
+        result = registry.research("NetworkDown", auto_confirm=True, allow_network=True)
+
+    assert result["inferred_type"] == "unknown"
+    assert result["confidence"] == 0.0
 
 
 def test_research_local_only_not_cached(tmp_path):
@@ -336,6 +438,17 @@ def test_extract_people_from_query(tmp_path):
     assert "Devon" not in found
 
 
+def test_extract_people_from_query_respects_disambiguation(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.seed(
+        mode="personal",
+        people=[{"name": "Ever", "relationship": "friend", "context": "personal"}],
+        projects=[],
+    )
+    found = registry.extract_people_from_query("Ever said hello to us during planning")
+    assert "Ever" in found
+
+
 # ── extract_unknown_candidates ──────────────────────────────────────────
 
 
@@ -371,3 +484,38 @@ def test_summary(tmp_path):
     assert "personal" in s
     assert "Riley" in s
     assert "MemPalace" in s
+
+
+def test_confirm_research_marks_common_word_as_ambiguous(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+
+    registry.confirm_research("May", entity_type="person")
+
+    assert "may" in registry.ambiguous_flags
+
+
+def test_learn_from_text_discovers_new_person(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+
+    with (
+        patch("mempalace.entity_detector.extract_candidates", return_value={"Riley": 2}),
+        patch("mempalace.entity_detector.score_entity", return_value={"value": 0.9}),
+        patch(
+            "mempalace.entity_detector.classify_entity",
+            return_value={"type": "person", "name": "Riley", "confidence": 0.9},
+        ),
+    ):
+        new_candidates = registry.learn_from_text("Riley did a lot of work today.")
+
+    assert any(candidate["name"] == "Riley" for candidate in new_candidates)
+    assert "Riley" in registry.people
+    assert registry.people["Riley"]["source"] == "learned"
+
+
+def test_extract_unknown_candidates_skips_common_words(tmp_path):
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    with patch("mempalace.palace._candidate_entity_words", return_value=["Ever", "Saoirse"]):
+        unknown = registry.extract_unknown_candidates("Ever and Saoirse are names")
+
+    assert "Ever" not in unknown
+    assert "Saoirse" in unknown

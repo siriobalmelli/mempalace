@@ -6,9 +6,12 @@ import chromadb
 import pytest
 
 from mempalace.backends import (
+    BaseBackend,
+    BaseCollection,
     GetResult,
     PalaceRef,
     QueryResult,
+    HealthStatus,
     UnsupportedFilterError,
     available_backends,
     get_backend,
@@ -279,6 +282,144 @@ def test_base_collection_update_default_rejects_mismatched_lengths():
 
     with pytest.raises(ValueError, match="metadatas length"):
         BaseCollection.update(collection, ids=["1", "2"], metadatas=[{"k": 9}])
+
+
+class _TestCollection(BaseCollection):
+    def __init__(self, existing):
+        self._existing = existing
+        self.upsert_calls = []
+
+    def add(self, *, documents, ids, metadatas=None, embeddings=None):
+        return None
+
+    def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
+        self.upsert_calls.append(
+            {
+                "documents": documents,
+                "ids": ids,
+                "metadatas": metadatas,
+                "embeddings": embeddings,
+            }
+        )
+
+    def query(
+        self,
+        *,
+        query_texts=None,
+        query_embeddings=None,
+        n_results=10,
+        where=None,
+        where_document=None,
+        include=None,
+    ):
+        raise NotImplementedError
+
+    def get(
+        self,
+        *,
+        ids=None,
+        where=None,
+        where_document=None,
+        limit=None,
+        offset=None,
+        include=None,
+    ):
+        return self._existing
+
+    def delete(self, *, ids=None, where=None):
+        return None
+
+    def count(self):
+        return len(self._existing.ids)
+
+
+def test_base_collection_update_merges_input_and_reuses_existing_rows():
+    existing = GetResult(
+        ids=["a", "b"],
+        documents=["old-a", "old-b"],
+        metadatas=[{"source": "api"}, {"source": "cli"}],
+    )
+    collection = _TestCollection(existing=existing)
+
+    collection.update(
+        ids=["a", "b"],
+        documents=["new-a", "new-b"],
+        metadatas=[{"new": 1}, {"fresh": 2}],
+    )
+
+    assert collection.upsert_calls == [
+        {
+            "documents": ["new-a", "new-b"],
+            "ids": ["a", "b"],
+            "metadatas": [
+                {"source": "api", "new": 1},
+                {"source": "cli", "fresh": 2},
+            ],
+            "embeddings": None,
+        }
+    ]
+
+
+def test_base_collection_update_rejects_empty_payload():
+    collection = _TestCollection(
+        existing=GetResult(ids=["a"], documents=["old"], metadatas=[{"source": "api"}])
+    )
+
+    with pytest.raises(ValueError, match="update requires at least one"):
+        collection.update(ids=["a"])
+
+
+def test_dict_compat_line_endpoints_are_covered():
+    result = QueryResult(
+        ids=[["1"]],
+        documents=[["a"]],
+        metadatas=[[{"x": 1}]],
+        distances=[[0.1]],
+        embeddings=None,
+    )
+
+    with pytest.raises(KeyError):
+        result["missing"]
+
+    assert result.get("embeddings", ["missing-default"]) == ["missing-default"]
+    assert result.get("documents") == [["a"]]
+    assert "ids" in result
+    assert "missing" not in result
+
+
+def test_query_and_get_result_factory_helpers_and_health_status_defaults():
+    empty = GetResult.empty()
+    assert empty.ids == []
+    assert empty.documents == []
+    assert empty.metadatas == []
+    assert empty.embeddings is None
+
+    assert HealthStatus.healthy("ready").ok
+    assert HealthStatus.healthy("ready").detail == "ready"
+    assert HealthStatus.unhealthy("down").ok is False
+    assert HealthStatus.unhealthy("down").detail == "down"
+
+
+class _DummyBackend(BaseBackend):
+    name = "dummy"
+
+    def get_collection(
+        self,
+        *,
+        palace,
+        collection_name,
+        create=False,
+        options=None,
+    ):
+        raise RuntimeError("not implemented in test")
+
+
+def test_base_backend_defaults_are_noop_and_healthy():
+    backend = _DummyBackend()
+
+    backend.close_palace(PalaceRef(id="p"))
+    backend.close()
+    assert backend.health() == HealthStatus.healthy()
 
 
 def test_chroma_backend_accepts_palace_ref_kwarg(tmp_path):

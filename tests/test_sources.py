@@ -2,6 +2,7 @@
 
 import pytest
 
+from mempalace.sources import registry as source_registry
 from mempalace.sources import (
     AdapterSchema,
     BaseSourceAdapter,
@@ -465,3 +466,140 @@ def test_entry_point_group_exists_and_returns_zero_or_more_adapters():
     # party packages can register. ``available_adapters`` MUST NOT raise.
     adapters = available_adapters()
     assert isinstance(adapters, list)
+
+
+# ---------------------------------------------------------------------------
+# registry internals
+# ---------------------------------------------------------------------------
+
+
+class _EntryPointAdapter(BaseSourceAdapter):
+    name = "_entrypoint"
+    adapter_version = "0.1.0"
+    capabilities = frozenset({"byte_preserving"})
+    supported_modes = frozenset({"whole_record"})
+    declared_transformations = frozenset()
+    default_privacy_class = "public"
+
+    def ingest(self, *, source, palace):
+        yield SourceItemMetadata(source_file=source.uri or "entrypoint")
+
+    def describe_schema(self):
+        return AdapterSchema(
+            version="1.0",
+            fields={"example": FieldSpec(type="string", required=False, description="x")},
+        )
+
+
+class _ConflictingAdapter(BaseSourceAdapter):
+    name = "_entrypoint"
+    adapter_version = "0.2.0"
+    capabilities = frozenset({"byte_preserving"})
+    supported_modes = frozenset({"whole_record"})
+    declared_transformations = frozenset()
+    default_privacy_class = "public"
+
+    def ingest(self, *, source, palace):
+        return iter(())
+
+    def describe_schema(self):
+        return AdapterSchema(
+            version="1.0",
+            fields={"example": FieldSpec(type="string", required=False, description="x")},
+        )
+
+
+class _CloseErrorAdapter(BaseSourceAdapter):
+    name = "_close_error"
+    adapter_version = "0.1.0"
+    capabilities = frozenset({"byte_preserving"})
+    supported_modes = frozenset({"whole_record"})
+    declared_transformations = frozenset()
+    default_privacy_class = "public"
+
+    def ingest(self, *, source, palace):
+        return iter(())
+
+    def describe_schema(self):
+        return AdapterSchema(
+            version="1.0",
+            fields={"example": FieldSpec(type="string", required=False, description="x")},
+        )
+
+    def close(self):
+        raise RuntimeError("close failed")
+
+
+class _FakeEP:
+    def __init__(self, name, value):
+        self.name = name
+        self._value = value
+
+    def load(self):
+        if isinstance(self._value, Exception):
+            raise self._value
+        return self._value
+
+
+def _reset_source_registry():
+    source_registry._discovered = False
+    source_registry._registry.clear()
+    source_registry._instances.clear()
+    source_registry._explicit.clear()
+
+
+def test_registry_discovers_entry_points_only_once_and_caches_results(monkeypatch):
+    class _FakeEntryPoints:
+        def select(self, group):
+            assert group == "mempalace.sources"
+            return [_FakeEP("_entrypoint", _EntryPointAdapter)]
+
+    _reset_source_registry()
+    monkeypatch.setattr(source_registry.metadata, "entry_points", lambda: _FakeEntryPoints())
+
+    assert source_registry.available_adapters() == ["_entrypoint"]
+    assert source_registry.get_adapter_class("_entrypoint") is _EntryPointAdapter
+    first = source_registry.get_adapter("_entrypoint")
+    second = source_registry.get_adapter("_entrypoint")
+    assert first is second
+
+
+def test_registry_prefers_explicit_registration_over_entry_point(monkeypatch):
+    class _FakeEntryPoints:
+        def select(self, group):
+            return [_FakeEP("_entrypoint", _EntryPointAdapter)]
+
+    _reset_source_registry()
+    source_registry.register("_entrypoint", _ConflictingAdapter)
+    monkeypatch.setattr(source_registry.metadata, "entry_points", lambda: _FakeEntryPoints())
+
+    assert source_registry.get_adapter_class("_entrypoint") is _ConflictingAdapter
+
+
+def test_registry_ignores_invalid_entry_points(monkeypatch):
+    class _FakeEntryPoints:
+        def select(self, group):
+            return [_FakeEP("_bad", object()), _FakeEP("_broken", ValueError("boom"))]
+
+    _reset_source_registry()
+    monkeypatch.setattr(source_registry.metadata, "entry_points", lambda: _FakeEntryPoints())
+
+    assert source_registry.available_adapters() == []
+
+
+def test_registry_entry_point_errors_dont_raise_during_discovery(monkeypatch):
+    def _boom():
+        raise RuntimeError("metadata failed")
+
+    _reset_source_registry()
+    monkeypatch.setattr(source_registry.metadata, "entry_points", _boom)
+    assert source_registry.available_adapters() == []
+
+
+def test_registry_reset_adapters_swallows_adapter_errors(monkeypatch):
+    _reset_source_registry()
+    source_registry.register("_close_error", _CloseErrorAdapter)
+    source_registry.get_adapter("_close_error")
+
+    # The reset path must close cached instances and keep going when close() fails.
+    source_registry.reset_adapters()
