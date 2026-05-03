@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import sys
+import unittest.mock
 import time
 
 import pytest
@@ -125,6 +127,28 @@ def test_palace_write_lock_timeout_when_held(tmp_path, monkeypatch):
         assert time.monotonic() - start < 1.0
 
 
+def test_palace_write_lock_timeout_zero_fails_immediately(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    with palace_write_lock(palace):
+        start = time.monotonic()
+        with pytest.raises(PalaceWriteLockTimeout):
+            with palace_write_lock(palace, blocking=True, timeout=0):
+                pytest.fail("blocking with timeout 0 should fail immediately")
+        assert time.monotonic() - start < 0.5
+
+
+def test_palace_write_lock_negative_timeout_treated_as_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    with palace_write_lock(palace):
+        start = time.monotonic()
+        with pytest.raises(PalaceWriteLockTimeout):
+            with palace_write_lock(palace, blocking=True, timeout=-1):
+                pytest.fail("negative timeout should be clamped to zero")
+        assert time.monotonic() - start < 0.5
+
+
 def test_palace_write_lock_uses_env_timeout(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", "0.05")
@@ -137,6 +161,15 @@ def test_palace_write_lock_uses_env_timeout(tmp_path, monkeypatch):
         assert time.monotonic() - start < 1.0
 
 
+def test_palace_write_lock_very_short_timeout_still_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    with palace_write_lock(palace):
+        with pytest.raises(PalaceWriteLockTimeout):
+            with palace_write_lock(palace, blocking=True, timeout=0.001):
+                pytest.fail("very short timeout should still raise when lock is held")
+
+
 def test_palace_write_lock_conflicts_with_mine_lock(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     palace = str(tmp_path / "palace")
@@ -144,6 +177,101 @@ def test_palace_write_lock_conflicts_with_mine_lock(tmp_path, monkeypatch):
         with pytest.raises(PalaceWriteLockTimeout):
             with palace_write_lock(palace, blocking=False):
                 pytest.fail("write lock should share mine lock key")
+
+
+def test_palace_write_lock_timeout_value_from_env_garbage(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", "not_a_number")
+    from mempalace.palace import _palace_lock_timeout
+
+    assert _palace_lock_timeout() == 60.0
+
+
+def test_palace_write_lock_timeout_value_from_env_empty_uses_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", raising=False)
+    from mempalace.palace import _palace_lock_timeout
+
+    assert _palace_lock_timeout() == 60.0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="mocks msvcrt on non-Windows")
+def test_windows_nonblocking_acquire_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "name", "nt")
+    fake_msvcrt = unittest.mock.MagicMock()
+    fake_msvcrt.LK_NBLCK = 1
+    fake_msvcrt.LK_UNLCK = 2
+    fake_msvcrt.locking.return_value = None
+
+    with unittest.mock.patch.dict("sys.modules", {"msvcrt": fake_msvcrt}):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with palace_write_lock(str(tmp_path / "palace"), blocking=False):
+            pass
+
+    assert fake_msvcrt.locking.called
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="mocks msvcrt on non-Windows")
+def test_windows_nonblocking_acquire_fails_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "name", "nt")
+    fake_msvcrt = unittest.mock.MagicMock()
+    fake_msvcrt.LK_NBLCK = 1
+    fake_msvcrt.LK_UNLCK = 2
+    fake_msvcrt.locking.side_effect = OSError("simulated lock failure")
+
+    with unittest.mock.patch.dict("sys.modules", {"msvcrt": fake_msvcrt}):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with pytest.raises(PalaceWriteLockTimeout):
+            with palace_write_lock(str(tmp_path / "palace"), blocking=False):
+                pytest.fail("non-blocking acquire should raise")
+
+    assert fake_msvcrt.locking.called
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="mocks msvcrt on non-Windows")
+def test_windows_blocking_acquire_retries_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "name", "nt")
+    fake_msvcrt = unittest.mock.MagicMock()
+    fake_msvcrt.LK_NBLCK = 1
+    fake_msvcrt.LK_UNLCK = 2
+    fake_msvcrt.locking.side_effect = [
+        OSError("first failure"),
+        OSError("second failure"),
+        None,
+        None,
+    ]
+
+    with unittest.mock.patch.dict("sys.modules", {"msvcrt": fake_msvcrt}):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with palace_write_lock(str(tmp_path / "palace"), blocking=True, timeout=1.0):
+            pass
+
+    lock_calls = [
+        call for call in fake_msvcrt.locking.call_args_list if call.args[1] == fake_msvcrt.LK_NBLCK
+    ]
+    unlock_calls = [
+        call for call in fake_msvcrt.locking.call_args_list if call.args[1] == fake_msvcrt.LK_UNLCK
+    ]
+    assert len(lock_calls) >= 2
+    assert len(unlock_calls) >= 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="mocks msvcrt on non-Windows")
+def test_windows_release_calls_unlock(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "name", "nt")
+    fake_msvcrt = unittest.mock.MagicMock()
+    fake_msvcrt.LK_NBLCK = 1
+    fake_msvcrt.LK_UNLCK = 2
+    fake_msvcrt.locking.return_value = None
+
+    with unittest.mock.patch.dict("sys.modules", {"msvcrt": fake_msvcrt}):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with palace_write_lock(str(tmp_path / "palace"), blocking=False):
+            pass
+
+    args = [call.args[1] for call in fake_msvcrt.locking.call_args_list]
+    assert fake_msvcrt.LK_NBLCK in args
+    assert fake_msvcrt.LK_UNLCK in args
 
 
 def test_mine_palace_lock_still_raises_mine_already_running(tmp_path, monkeypatch):

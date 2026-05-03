@@ -264,7 +264,10 @@ def _refresh_vector_disabled_flag() -> None:
 # enables review/rollback of writes from external or untrusted sources.
 
 _WAL_DIR = Path(os.path.expanduser("~/.mempalace/wal"))
-_WAL_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    _WAL_DIR.mkdir(parents=True, exist_ok=True)
+except (OSError, NotImplementedError):
+    pass
 try:
     _WAL_DIR.chmod(0o700)
 except (OSError, NotImplementedError):
@@ -306,7 +309,7 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception as e:
-        logger.error(f"WAL write failed: {e}")
+        logger.error("WAL write failed: %s", e)
 
 
 def _get_client():
@@ -728,7 +731,12 @@ def tool_search(
     # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
-    dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
+    if min_similarity is not None:
+        if min_similarity < 0 or min_similarity > 1:
+            return {"error": "min_similarity must be between 0 and 1"}
+        dist = 1.0 - min_similarity
+    else:
+        dist = max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
     # Ensure the vector-disabled probe has been run via the safe
@@ -1838,6 +1846,10 @@ TOOLS = {
                 "max_distance": {
                     "type": "number",
                     "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
+                },
+                "min_similarity": {
+                    "type": "number",
+                    "description": "Deprecated: use max_distance instead. Higher = stricter (0-1 scale). Converted to max_distance = 1 - min_similarity.",
                 },
                 "context": {
                     "type": "string",

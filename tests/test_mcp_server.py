@@ -7,6 +7,7 @@ via monkeypatch to avoid touching real data.
 """
 
 from datetime import datetime
+import inspect
 import json
 import multiprocessing
 import os
@@ -19,10 +20,113 @@ import time
 import pytest
 
 
+PALACE_WRITE_TOOLS = {
+    "mempalace_add_drawer",
+    "mempalace_delete_drawer",
+    "mempalace_update_drawer",
+    "mempalace_kg_add",
+    "mempalace_kg_invalidate",
+    "mempalace_diary_write",
+}
+
+TOOL_ARG_DEFAULTS = {
+    "query": "hello",
+    "limit": 1,
+    "offset": 0,
+    "last_n": 3,
+    "max_hops": 1,
+    "wing": "team",
+    "room": "notes",
+    "drawer_id": "drawer_unit_abc",
+    "entity": "Alice",
+    "subject": "Alice",
+    "predicate": "likes",
+    "object": "chess",
+    "agent_name": "agent",
+    "entry": "daily update",
+    "start_room": "overview",
+    "tunnel_id": "tunnel_1",
+    "source_wing": "backend",
+    "source_room": "planning",
+    "target_wing": "frontend",
+    "target_room": "design",
+    "content": "Sample diary entry",
+}
+
+
+def _required_tool_args(tool_name: str, mcp_server):
+    schema = mcp_server.TOOLS[tool_name]["input_schema"]
+    args = {key: TOOL_ARG_DEFAULTS.get(key, "value") for key in schema.get("required", [])}
+    if tool_name == "mempalace_update_drawer":
+        args.setdefault("content", "updated content")
+        args.setdefault("wing", "team")
+    return args
+
+
+class _StubCollection:
+    def get(self, *args, **kwargs):
+        return {"ids": [], "documents": [], "metadatas": []}
+
+    def query(self, *args, **kwargs):
+        return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+    def count(self):
+        return 0
+
+    def upsert(self, *args, **kwargs):
+        return None
+
+    def add(self, *args, **kwargs):
+        return None
+
+    def update(self, *args, **kwargs):
+        return None
+
+    def delete(self, *args, **kwargs):
+        return None
+
+
+class _StubKG:
+    def query_entity(self, *args, **kwargs):
+        return []
+
+    def timeline(self, *args, **kwargs):
+        return []
+
+    def stats(self):
+        return {"entities": 0, "triples": 0}
+
+    def add_triple(self, *args, **kwargs):
+        return "triple_id"
+
+    def invalidate(self, *args, **kwargs):
+        return None
+
+
+def _install_readonly_backends(monkeypatch, mcp_server):
+    stub_col = _StubCollection()
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda *args, **kwargs: stub_col)
+    monkeypatch.setattr(mcp_server, "search_memories", lambda *args, **kwargs: {"results": []})
+    monkeypatch.setattr(mcp_server, "_fetch_all_metadata", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mcp_server, "_get_cached_metadata", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mcp_server, "_kg", _StubKG())
+    monkeypatch.setattr(mcp_server, "traverse", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mcp_server, "find_tunnels", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mcp_server, "graph_stats", lambda *args, **kwargs: {})
+    monkeypatch.setattr(mcp_server, "create_tunnel", lambda *args, **kwargs: {"created": True})
+    monkeypatch.setattr(mcp_server, "list_tunnels", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mcp_server, "delete_tunnel", lambda *args, **kwargs: {"deleted": True})
+    monkeypatch.setattr(mcp_server, "follow_tunnels", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mcp_server, "_wal_log", lambda *args, **kwargs: None)
+
+
 def _patch_mcp_server(monkeypatch, config, kg):
     """Patch the mcp_server module globals to use test fixtures."""
     from mempalace import mcp_server
 
+    old_kg = getattr(mcp_server, "_kg", None)
+    if old_kg is not kg and hasattr(old_kg, "close"):
+        old_kg.close()
     monkeypatch.setattr(mcp_server, "_config", config)
     monkeypatch.setattr(mcp_server, "_kg", kg)
 
@@ -88,6 +192,60 @@ def _wait_for_file(path: str, timeout: float = 5.0) -> bool:
             return True
         time.sleep(0.01)
     return os.path.exists(path)
+
+
+# ── Internal test helpers ───────────────────────────────────────────────
+
+
+def _run_tool_with_external_write_lock(
+    monkeypatch,
+    config,
+    kg,
+    tmp_path,
+    tool,
+    tool_args,
+    *,
+    timeout_env="0.05",
+):
+    """Run a tool while another process holds the write lock."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    if timeout_env is not None:
+        monkeypatch.setenv("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", timeout_env)
+
+    ctx = _get_mp_context()
+    suffix = tool.__name__
+    ready = str(tmp_path / f"holder-ready-{suffix}")
+    release = str(tmp_path / f"holder-release-{suffix}")
+    holder = ctx.Process(
+        target=_hold_palace_write_lock_process,
+        args=(config.palace_path, os.environ["HOME"], ready, release),
+    )
+    holder.start()
+    result = None
+    try:
+        assert _wait_for_file(ready), "holder did not acquire lock"
+        result = tool(**tool_args)
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=5)
+    assert holder.exitcode == 0
+    return result
+
+
+def _get_isolated_mcp_server(monkeypatch, config, kg, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", config.palace_path)
+    import importlib
+
+    from mempalace import mcp_server
+
+    old_kg = getattr(mcp_server, "_kg", None)
+    if hasattr(old_kg, "close"):
+        old_kg.close()
+    mcp_server = importlib.reload(mcp_server)
+    _patch_mcp_server(monkeypatch, config, kg)
+    return mcp_server
 
 
 # ── Protocol Layer ──────────────────────────────────────────────────────
@@ -441,12 +599,18 @@ class TestSearchTool:
         from mempalace.mcp_server import tool_search
 
         # Old name should work
-        result = tool_search(query="JWT", min_similarity=1.5)
+        result = tool_search(query="JWT", min_similarity=0.5)
         assert "results" in result
 
+        result = tool_search(query="JWT", min_similarity=-0.1)
+        assert "error" in result
+
+        result = tool_search(query="JWT", min_similarity=1.1)
+        assert "error" in result
+
         # Old name takes precedence when both provided
-        result_strict = tool_search(query="JWT", max_distance=999.0, min_similarity=0.01)
-        result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
+        result_strict = tool_search(query="JWT", max_distance=999.0, min_similarity=0.9)
+        result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=0.1)
         assert len(result_strict["results"]) <= len(result_loose["results"])
 
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
@@ -538,6 +702,268 @@ class TestSearchTool:
             entry = json.loads(line)
             assert entry["palace_path"] == config.palace_path
             assert entry["params"]["content"].startswith("[REDACTED")
+
+    def test_mcp_import_survives_uncreatable_wal_dir(self, config, tmp_path):
+        home_file = tmp_path / "home-is-a-file"
+        home_file.write_text("not a directory", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["HOME"] = str(home_file)
+        env["USERPROFILE"] = str(home_file)
+        env["MEMPALACE_PALACE_PATH"] = config.palace_path
+        code = (
+            "from mempalace import mcp_server; "
+            "mcp_server._wal_log('test', {'safe': 'ok'}); "
+            "print('ok')"
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+
+
+class TestToolsInvariants:
+    def test_every_tool_has_handler(self, monkeypatch, config, kg, tmp_path):
+        mcp_server = _get_isolated_mcp_server(monkeypatch, config, kg, tmp_path)
+
+        for tool_name, entry in mcp_server.TOOLS.items():
+            assert callable(entry["handler"]), f"{tool_name} handler is not callable"
+
+    def test_every_tool_has_description(self, monkeypatch, config, kg, tmp_path):
+        mcp_server = _get_isolated_mcp_server(monkeypatch, config, kg, tmp_path)
+
+        for tool_name, entry in mcp_server.TOOLS.items():
+            desc = entry.get("description")
+            assert isinstance(desc, str), f"{tool_name} description must be a string"
+            assert desc, f"{tool_name} description must not be empty"
+
+    def test_every_tool_has_input_schema_with_type(self, monkeypatch, config, kg, tmp_path):
+        mcp_server = _get_isolated_mcp_server(monkeypatch, config, kg, tmp_path)
+
+        for tool_name, entry in mcp_server.TOOLS.items():
+            assert "input_schema" in entry, f"{tool_name} missing input_schema"
+            schema = entry["input_schema"]
+            assert schema["type"] == "object", f"{tool_name} input schema must be object"
+
+    def test_handler_params_subset_of_schema_properties(self, monkeypatch, config, kg, tmp_path):
+        mcp_server = _get_isolated_mcp_server(monkeypatch, config, kg, tmp_path)
+
+        for tool_name, entry in mcp_server.TOOLS.items():
+            schema = entry["input_schema"]
+            properties = set(schema.get("properties", {}).keys())
+            for param_name, param in inspect.signature(entry["handler"]).parameters.items():
+                if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+                    continue
+                assert (
+                    param_name in properties
+                ), f"{tool_name} has param '{param_name}' not in schema properties"
+
+    def test_schema_required_subset_of_properties(self, monkeypatch, config, kg, tmp_path):
+        mcp_server = _get_isolated_mcp_server(monkeypatch, config, kg, tmp_path)
+
+        for tool_name, entry in mcp_server.TOOLS.items():
+            schema = entry["input_schema"]
+            properties = set(schema.get("properties", {}).keys())
+            required = set(schema.get("required", []))
+            assert required <= properties, f"{tool_name} required keys not in properties"
+
+    def test_write_tools_use_palace_write_lock(self, monkeypatch, config, kg, tmp_path):
+        mcp_server = _get_isolated_mcp_server(monkeypatch, config, kg, tmp_path)
+        lock_calls = []
+
+        class _LockSpy:
+            def __call__(self, *args, **kwargs):
+                lock_calls.append(kwargs.get("purpose", ""))
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        _install_readonly_backends(monkeypatch, mcp_server)
+        monkeypatch.setattr(mcp_server, "_wal_log", lambda *args, **kwargs: None)
+        spy = _LockSpy()
+        monkeypatch.setattr(mcp_server, "palace_write_lock", spy)
+
+        for name, entry in mcp_server.TOOLS.items():
+            if name not in PALACE_WRITE_TOOLS:
+                continue
+            before = len(lock_calls)
+            entry["handler"](**_required_tool_args(name, mcp_server))
+            assert len(lock_calls) == before + 1
+
+        assert set(lock_calls) == {
+            "add_drawer",
+            "delete_drawer",
+            "update_drawer",
+            "kg_add",
+            "kg_invalidate",
+            "diary_write",
+        }
+
+    def test_read_tools_do_not_use_palace_write_lock(self, monkeypatch, config, kg, tmp_path):
+        mcp_server = _get_isolated_mcp_server(monkeypatch, config, kg, tmp_path)
+
+        lock_calls = []
+
+        class _LockSpy:
+            def __call__(self, *args, **kwargs):
+                lock_calls.append(kwargs.get("purpose", ""))
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        _install_readonly_backends(monkeypatch, mcp_server)
+        monkeypatch.setattr(mcp_server, "palace_write_lock", _LockSpy())
+
+        for name, entry in mcp_server.TOOLS.items():
+            if name in PALACE_WRITE_TOOLS:
+                continue
+            result = entry["handler"](**_required_tool_args(name, mcp_server))
+            assert result is not None
+        assert not lock_calls
+
+
+class TestReadToolsNoLock:
+    @pytest.mark.parametrize(
+        "tool_name,tool_args",
+        [
+            ("tool_status", {}),
+            ("tool_list_wings", {}),
+            ("tool_list_rooms", {}),
+            ("tool_get_taxonomy", {}),
+            ("tool_search", {"query": "test"}),
+            ("tool_get_drawer", {"drawer_id": "nonexistent"}),
+            ("tool_list_drawers", {}),
+            ("tool_kg_query", {"entity": "Alice"}),
+            ("tool_kg_timeline", {}),
+            ("tool_kg_stats", {}),
+            ("tool_diary_read", {"agent_name": "Nobody"}),
+        ],
+    )
+    def test_read_tool_not_blocked_by_write_lock(
+        self,
+        monkeypatch,
+        config,
+        palace_path,
+        kg,
+        tmp_path,
+        tool_name,
+        tool_args,
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _get_collection(palace_path, create=True)
+        from mempalace import mcp_server
+
+        ctx = _get_mp_context()
+        ready = str(tmp_path / f"holder-ready-{tool_name}")
+        release = str(tmp_path / f"holder-release-{tool_name}")
+        holder = ctx.Process(
+            target=_hold_palace_write_lock_process,
+            args=(config.palace_path, os.environ["HOME"], ready, release),
+        )
+        holder.start()
+        try:
+            assert _wait_for_file(ready), "holder did not acquire lock"
+            tool = getattr(mcp_server, tool_name)
+            result = tool(**tool_args)
+            assert "palace write lock timeout" not in json.dumps(result)
+        finally:
+            open(release, "w").close()
+            holder.join(timeout=5)
+        assert holder.exitcode == 0
+
+    def test_check_duplicate_not_blocked_by_write_lock(
+        self, monkeypatch, config, palace_path, seeded_collection, kg, tmp_path
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        ctx = _get_mp_context()
+        ready = str(tmp_path / "holder-ready-check-duplicate")
+        release = str(tmp_path / "holder-release-check-duplicate")
+        holder = ctx.Process(
+            target=_hold_palace_write_lock_process,
+            args=(config.palace_path, os.environ["HOME"], ready, release),
+        )
+        holder.start()
+        try:
+            assert _wait_for_file(ready), "holder did not acquire lock"
+            result = mcp_server.tool_check_duplicate("hello there", threshold=0.5)
+            assert "palace write lock timeout" not in json.dumps(result)
+        finally:
+            open(release, "w").close()
+            holder.join(timeout=5)
+        assert holder.exitcode == 0
+
+
+class TestWALFromRealWrites:
+    def test_wal_captures_palace_path_from_real_add_drawer(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        _get_collection(palace_path, create=True)
+
+        wal_file = tmp_path / "write_log_add.jsonl"
+        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+
+        result = mcp_server.tool_add_drawer(
+            wing="unit", room="tools", content="Real WAL path check for add_drawer."
+        )
+        assert result["success"] is True
+
+        entry = json.loads(wal_file.read_text().splitlines()[-1])
+        assert entry["operation"] == "add_drawer"
+        assert entry["palace_path"] == config.palace_path
+        assert entry["params"]["drawer_id"] == result["drawer_id"]
+
+    def test_wal_captures_palace_path_from_real_kg_add(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        wal_file = tmp_path / "write_log_kg_add.jsonl"
+        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+
+        result = mcp_server.tool_kg_add(subject="A", predicate="p", object="B")
+        assert result["success"] is True
+
+        entry = json.loads(wal_file.read_text().splitlines()[-1])
+        assert entry["operation"] == "kg_add"
+        assert entry["palace_path"] == config.palace_path
+        assert entry["params"]["subject"] == "A"
+
+    def test_wal_captures_palace_path_from_real_delete_drawer(
+        self, monkeypatch, config, palace_path, seeded_collection, kg, tmp_path
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        wal_file = tmp_path / "write_log_delete.jsonl"
+        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+
+        result = mcp_server.tool_delete_drawer("drawer_proj_backend_aaa")
+        assert result["success"] is True
+
+        entry = json.loads(wal_file.read_text().splitlines()[-1])
+        assert entry["operation"] == "delete_drawer"
+        assert entry["palace_path"] == config.palace_path
+        assert entry["params"]["drawer_id"] == "drawer_proj_backend_aaa"
 
 
 # ── Write Tools ─────────────────────────────────────────────────────────
@@ -775,28 +1201,106 @@ class TestWriteTools:
         self, monkeypatch, config, palace_path, kg, tmp_path
     ):
         """Direct write tool calls must return JSON-safe lock timeout errors."""
-        _patch_mcp_server(monkeypatch, config, kg)
-        monkeypatch.setenv("MEMPALACE_MCP_WRITE_LOCK_TIMEOUT", "0.05")
         from mempalace import mcp_server
 
-        ctx = _get_mp_context()
-        ready = str(tmp_path / "holder-ready")
-        release = str(tmp_path / "holder-release")
-        holder = ctx.Process(
-            target=_hold_palace_write_lock_process,
-            args=(config.palace_path, os.environ["HOME"], ready, release),
+        result = _run_tool_with_external_write_lock(
+            monkeypatch,
+            config,
+            kg,
+            tmp_path,
+            mcp_server.tool_add_drawer,
+            {"wing": "w", "room": "r", "content": "blocked write"},
         )
-        holder.start()
-        try:
-            assert _wait_for_file(ready), "holder did not acquire lock"
-            result = mcp_server.tool_add_drawer(wing="w", room="r", content="blocked write")
-            assert result["success"] is False
-            assert result["error"] == "palace write lock timeout"
-            assert result["palace_path"] == config.palace_path
-        finally:
-            open(release, "w").close()
-            holder.join(timeout=5)
-        assert holder.exitcode == 0
+        assert result["success"] is False
+        assert result["error"] == "palace write lock timeout"
+        assert result["palace_path"] == config.palace_path
+
+    def test_delete_drawer_lock_timeout_returns_structured_error(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        from mempalace import mcp_server
+
+        result = _run_tool_with_external_write_lock(
+            monkeypatch,
+            config,
+            kg,
+            tmp_path,
+            mcp_server.tool_delete_drawer,
+            {"drawer_id": "any"},
+        )
+        assert result["success"] is False
+        assert result["error"] == "palace write lock timeout"
+        assert result["palace_path"] == config.palace_path
+
+    def test_update_drawer_lock_timeout_returns_structured_error(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        from mempalace import mcp_server
+
+        result = _run_tool_with_external_write_lock(
+            monkeypatch,
+            config,
+            kg,
+            tmp_path,
+            mcp_server.tool_update_drawer,
+            {"drawer_id": "any", "content": "lock test update"},
+        )
+        assert result["success"] is False
+        assert result["error"] == "palace write lock timeout"
+        assert result["palace_path"] == config.palace_path
+
+    def test_kg_add_lock_timeout_returns_structured_error(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        from mempalace import mcp_server
+
+        result = _run_tool_with_external_write_lock(
+            monkeypatch,
+            config,
+            kg,
+            tmp_path,
+            mcp_server.tool_kg_add,
+            {"subject": "S", "predicate": "P", "object": "O"},
+        )
+        assert result["success"] is False
+        assert result["error"] == "palace write lock timeout"
+        assert result["palace_path"] == config.palace_path
+
+    def test_kg_invalidate_lock_timeout_returns_structured_error(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        from mempalace import mcp_server
+
+        result = _run_tool_with_external_write_lock(
+            monkeypatch,
+            config,
+            kg,
+            tmp_path,
+            mcp_server.tool_kg_invalidate,
+            {"subject": "S", "predicate": "P", "object": "O"},
+        )
+        assert result["success"] is False
+        assert result["error"] == "palace write lock timeout"
+        assert result["palace_path"] == config.palace_path
+
+    def test_diary_write_lock_timeout_returns_structured_error(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        from mempalace import mcp_server
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        result = _run_tool_with_external_write_lock(
+            monkeypatch,
+            config,
+            kg,
+            tmp_path,
+            mcp_server.tool_diary_write,
+            {"agent_name": "A", "entry": "E"},
+        )
+        assert result["success"] is False
+        assert result["error"] == "palace write lock timeout"
+        assert result["palace_path"] == config.palace_path
 
     def test_handle_request_lock_timeout_is_tool_result(
         self, monkeypatch, config, palace_path, kg, tmp_path
@@ -829,32 +1333,6 @@ class TestWriteTools:
             body = json.loads(resp["result"]["content"][0]["text"])
             assert body["success"] is False
             assert body["error"] == "palace write lock timeout"
-        finally:
-            open(release, "w").close()
-            holder.join(timeout=5)
-        assert holder.exitcode == 0
-
-    def test_read_tool_not_blocked_by_external_write_lock(
-        self, monkeypatch, config, palace_path, kg, tmp_path
-    ):
-        """Read-only tools must not acquire or wait on the write lock."""
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_status
-
-        ctx = _get_mp_context()
-        ready = str(tmp_path / "holder-ready-read")
-        release = str(tmp_path / "holder-release-read")
-        holder = ctx.Process(
-            target=_hold_palace_write_lock_process,
-            args=(config.palace_path, os.environ["HOME"], ready, release),
-        )
-        holder.start()
-        try:
-            assert _wait_for_file(ready), "holder did not acquire lock"
-            result = tool_status()
-            assert "palace write lock timeout" not in json.dumps(result)
         finally:
             open(release, "w").close()
             holder.join(timeout=5)

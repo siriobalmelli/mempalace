@@ -5,7 +5,10 @@ import multiprocessing
 import os
 import queue
 import sqlite3
+import sys
 import time
+
+import pytest
 
 from mempalace.config import MempalaceConfig
 from mempalace.knowledge_graph import KnowledgeGraph
@@ -253,3 +256,81 @@ def test_kg_new_install_uses_selected_palace_path(tmp_path, monkeypatch):
     from mempalace.mcp_server import _migrate_legacy_kg
 
     assert _migrate_legacy_kg(str(palace)) == str(palace / "knowledge_graph.sqlite3")
+
+
+def test_kg_migration_corrupt_legacy_db_returns_target_without_crash(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _set_test_home(monkeypatch, home)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    legacy_kg = home / ".mempalace" / "knowledge_graph.sqlite3"
+    legacy_kg.parent.mkdir(parents=True, exist_ok=True)
+    legacy_kg.write_bytes(b"not a sqlite database")
+
+    from mempalace.mcp_server import _migrate_legacy_kg
+
+    result = _migrate_legacy_kg(str(palace))
+    assert result == str(palace / "knowledge_graph.sqlite3")
+
+
+def test_kg_migration_sidecar_cleanup_on_failure(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _set_test_home(monkeypatch, home)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    legacy_kg = home / ".mempalace" / "knowledge_graph.sqlite3"
+    legacy_graph = KnowledgeGraph(db_path=str(legacy_kg))
+    legacy_graph.add_entity("Legacy")
+    legacy_graph.close()
+
+    from mempalace import mcp_server
+
+    def _failing_replace(*_args, **_kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(os, "replace", _failing_replace)
+    result = mcp_server._migrate_legacy_kg(str(palace))
+    assert result == str(palace / "knowledge_graph.sqlite3")
+
+    base = str(palace / "knowledge_graph.sqlite3")
+    assert not os.path.exists(base + ".migrating")
+    assert not os.path.exists(base + ".migrating-wal")
+    assert not os.path.exists(base + ".migrating-shm")
+
+
+def test_kg_migration_same_path_legacy_and_target_is_noop(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _set_test_home(monkeypatch, home)
+    palace = home / ".mempalace"
+    palace.mkdir(parents=True, exist_ok=True)
+
+    legacy = palace / "knowledge_graph.sqlite3"
+    graph = KnowledgeGraph(db_path=str(legacy))
+    graph.add_entity("SamePath")
+    graph.close()
+
+    from mempalace.mcp_server import _migrate_legacy_kg
+
+    assert _migrate_legacy_kg(str(palace)) == str(palace / "knowledge_graph.sqlite3")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="chmod simulation is non-portable on Windows")
+def test_kg_migration_readonly_legacy_does_not_crash(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _set_test_home(monkeypatch, home)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    legacy_kg = home / ".mempalace" / "knowledge_graph.sqlite3"
+    legacy_kg.parent.mkdir(parents=True, exist_ok=True)
+    graph = KnowledgeGraph(db_path=str(legacy_kg))
+    graph.add_entity("LegacyReadOnly")
+    graph.close()
+    legacy_kg.chmod(0o000)
+
+    from mempalace.mcp_server import _migrate_legacy_kg
+
+    result = _migrate_legacy_kg(str(palace))
+    assert result == str(palace / "knowledge_graph.sqlite3")
