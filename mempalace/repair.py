@@ -535,7 +535,8 @@ def _detect_poisoned_max_seq_ids(
     If ``segment`` is given, the detection is restricted to that segment id
     (still only returning it if it actually exceeds the threshold).
     """
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         if segment is not None:
             rows = conn.execute(
                 "SELECT segment_id, seq_id FROM max_seq_id WHERE segment_id = ? AND seq_id > ?",
@@ -546,6 +547,8 @@ def _detect_poisoned_max_seq_ids(
                 "SELECT segment_id, seq_id FROM max_seq_id WHERE seq_id > ?",
                 (threshold,),
             ).fetchall()
+    finally:
+        conn.close()
     return [(str(sid), int(val)) for sid, val in rows]
 
 
@@ -594,8 +597,11 @@ def _read_sidecar_seq_ids(sidecar_path: str) -> dict[str, int]:
     if not os.path.isfile(sidecar_path):
         raise FileNotFoundError(f"Sidecar database not found: {sidecar_path}")
     out: dict[str, int] = {}
-    with sqlite3.connect(sidecar_path) as conn:
+    conn = sqlite3.connect(sidecar_path)
+    try:
         rows = conn.execute("SELECT segment_id, seq_id, typeof(seq_id) FROM max_seq_id").fetchall()
+    finally:
+        conn.close()
     for segment_id, seq_id, kind in rows:
         if kind == "blob":
             raise ValueError(
@@ -673,7 +679,8 @@ def repair_max_seq_id(
         sidecar_map = _read_sidecar_seq_ids(from_sidecar)
 
     plan: list[tuple[str, int, int]] = []
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         cur = conn.cursor()
         for seg_id, old_val in poisoned:
             if from_sidecar:
@@ -686,6 +693,8 @@ def repair_max_seq_id(
             plan.append((seg_id, old_val, new_val))
             result["before"][seg_id] = old_val
             result["after"][seg_id] = new_val
+    finally:
+        conn.close()
 
     print()
     print("  Report")
@@ -719,7 +728,8 @@ def repair_max_seq_id(
 
     _close_chroma_handles(palace_path)
 
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute("BEGIN")
         try:
             conn.executemany(
@@ -730,6 +740,8 @@ def repair_max_seq_id(
         except Exception:
             conn.rollback()
             raise
+    finally:
+        conn.close()
 
     remaining = _detect_poisoned_max_seq_ids(db_path, segment=segment, threshold=threshold)
     if remaining:

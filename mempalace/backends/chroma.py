@@ -628,31 +628,33 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
     marker = os.path.join(palace_path, _BLOB_FIX_MARKER)
     if os.path.isfile(marker):
         return
+    conn = None
     try:
-        with sqlite3.connect(db_path) as conn:
-            try:
-                rows = conn.execute(
-                    "SELECT rowid, seq_id FROM embeddings WHERE typeof(seq_id) = 'blob'"
-                ).fetchall()
-            except sqlite3.OperationalError:
-                return
-            safe_rows = [(rowid, blob) for rowid, blob in rows if not blob.startswith(b"\x11\x11")]
-            skipped = len(rows) - len(safe_rows)
-            if skipped:
-                logger.warning(
-                    "Skipped %d sysdb-10-format BLOB seq_id(s) in embeddings (not converting)",
-                    skipped,
-                )
-            if safe_rows:
-                updates = [
-                    (int.from_bytes(blob, byteorder="big"), rowid) for rowid, blob in safe_rows
-                ]
-                conn.executemany("UPDATE embeddings SET seq_id = ? WHERE rowid = ?", updates)
-                logger.info("Fixed %d BLOB seq_ids in embeddings", len(updates))
-                conn.commit()
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT rowid, seq_id FROM embeddings WHERE typeof(seq_id) = 'blob'"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        safe_rows = [(rowid, blob) for rowid, blob in rows if not blob.startswith(b"\x11\x11")]
+        skipped = len(rows) - len(safe_rows)
+        if skipped:
+            logger.warning(
+                "Skipped %d sysdb-10-format BLOB seq_id(s) in embeddings (not converting)",
+                skipped,
+            )
+        if safe_rows:
+            updates = [(int.from_bytes(blob, byteorder="big"), rowid) for rowid, blob in safe_rows]
+            conn.executemany("UPDATE embeddings SET seq_id = ? WHERE rowid = ?", updates)
+            logger.info("Fixed %d BLOB seq_ids in embeddings", len(updates))
+            conn.commit()
     except Exception:
         logger.exception("Could not fix BLOB seq_ids in %s", db_path)
         return
+    finally:
+        if conn is not None:
+            conn.close()
     # Write marker whether or not rows needed migration — the palace is now
     # confirmed to be in the INTEGER-seq_id state and future opens can skip the
     # sqlite3.connect() entirely.

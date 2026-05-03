@@ -52,60 +52,64 @@ def extract_drawers_from_sqlite(db_path: str) -> list:
     Works regardless of which ChromaDB version created the database.
     Returns list of dicts with 'id', 'document', and 'metadata' keys.
     """
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    conn = None
 
-    # Get all embedding IDs and their documents
-    rows = conn.execute(
-        """
-        SELECT e.embedding_id,
-               MAX(CASE WHEN em.key = 'chroma:document' THEN em.string_value END) as document
-        FROM embeddings e
-        JOIN embedding_metadata em ON em.id = e.id
-        GROUP BY e.embedding_id
-    """
-    ).fetchall()
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
 
-    drawers = []
-    for row in rows:
-        embedding_id = row["embedding_id"]
-        document = row["document"]
-        if not document:
-            continue
-
-        # Get metadata for this embedding
-        meta_rows = conn.execute(
+        # Get all embedding IDs and their documents
+        rows = conn.execute(
             """
-            SELECT em.key, em.string_value, em.int_value, em.float_value, em.bool_value
-            FROM embedding_metadata em
-            JOIN embeddings e ON e.id = em.id
-            WHERE e.embedding_id = ?
-              AND em.key NOT LIKE 'chroma:%'
-        """,
-            (embedding_id,),
+            SELECT e.embedding_id,
+                   MAX(CASE WHEN em.key = 'chroma:document' THEN em.string_value END) as document
+            FROM embeddings e
+            JOIN embedding_metadata em ON em.id = e.id
+            GROUP BY e.embedding_id
+        """
         ).fetchall()
 
-        metadata = {}
-        for mr in meta_rows:
-            key = mr["key"]
-            if mr["string_value"] is not None:
-                metadata[key] = mr["string_value"]
-            elif mr["int_value"] is not None:
-                metadata[key] = mr["int_value"]
-            elif mr["float_value"] is not None:
-                metadata[key] = mr["float_value"]
-            elif mr["bool_value"] is not None:
-                metadata[key] = bool(mr["bool_value"])
+        drawers = []
+        for row in rows:
+            embedding_id = row["embedding_id"]
+            document = row["document"]
+            if not document:
+                continue
 
-        drawers.append(
-            {
-                "id": embedding_id,
-                "document": document,
-                "metadata": metadata,
-            }
-        )
+            # Get metadata for this embedding
+            meta_rows = conn.execute(
+                """
+                SELECT em.key, em.string_value, em.int_value, em.float_value, em.bool_value
+                FROM embedding_metadata em
+                JOIN embeddings e ON e.id = em.id
+                WHERE e.embedding_id = ?
+                  AND em.key NOT LIKE 'chroma:%'
+            """,
+                (embedding_id,),
+            ).fetchall()
 
-    conn.close()
+            metadata = {}
+            for mr in meta_rows:
+                key = mr["key"]
+                if mr["string_value"] is not None:
+                    metadata[key] = mr["string_value"]
+                elif mr["int_value"] is not None:
+                    metadata[key] = mr["int_value"]
+                elif mr["float_value"] is not None:
+                    metadata[key] = mr["float_value"]
+                elif mr["bool_value"] is not None:
+                    metadata[key] = bool(mr["bool_value"])
+
+            drawers.append(
+                {
+                    "id": embedding_id,
+                    "document": document,
+                    "metadata": metadata,
+                }
+            )
+    finally:
+        if conn is not None:
+            conn.close()
     return drawers
 
 

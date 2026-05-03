@@ -489,12 +489,15 @@ def test_max_seq_id_detects_poison_rows(tmp_path):
     db_path = os.path.join(palace, "chroma.sqlite3")
 
     # Add one clean row to confirm the threshold actually filters.
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute(
             "INSERT INTO segments VALUES ('seg-clean', 'urn:vector', 'VECTOR', 'coll-clean')"
         )
         conn.execute("INSERT INTO max_seq_id VALUES ('seg-clean', 1234)")
         conn.commit()
+    finally:
+        conn.close()
 
     found = repair._detect_poisoned_max_seq_ids(db_path)
     ids = {sid for sid, _ in found}
@@ -535,19 +538,25 @@ def test_max_seq_id_from_sidecar_exact_restore(tmp_path):
         seg["closets_vec"]: 498001,
         seg["closets_meta"]: 498002,
     }
-    with sqlite3.connect(sidecar_path) as conn:
+    conn = sqlite3.connect(sidecar_path)
+    try:
         conn.execute("CREATE TABLE max_seq_id(segment_id TEXT PRIMARY KEY, seq_id INTEGER)")
         conn.executemany(
             "INSERT INTO max_seq_id VALUES (?, ?)",
             list(clean.items()),
         )
         conn.commit()
+    finally:
+        conn.close()
 
     result = repair.repair_max_seq_id(palace, from_sidecar=sidecar_path, assume_yes=True)
     assert result["segment_repaired"]
     db_path = os.path.join(palace, "chroma.sqlite3")
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         rows = dict(conn.execute("SELECT segment_id, seq_id FROM max_seq_id").fetchall())
+    finally:
+        conn.close()
     for sid, val in clean.items():
         assert rows[sid] == val
 
@@ -557,15 +566,21 @@ def test_max_seq_id_dry_run_no_mutation(tmp_path):
     seg = _seed_poisoned_max_seq_id(palace)
     db_path = os.path.join(palace, "chroma.sqlite3")
 
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         before = dict(conn.execute("SELECT segment_id, seq_id FROM max_seq_id").fetchall())
+    finally:
+        conn.close()
 
     result = repair.repair_max_seq_id(palace, dry_run=True)
     assert result["dry_run"] is True
     assert result["segment_repaired"] == []
 
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         after = dict(conn.execute("SELECT segment_id, seq_id FROM max_seq_id").fetchall())
+    finally:
+        conn.close()
     assert before == after
     # Nothing dropped into the palace dir either (no backup on dry-run).
     assert not any(fn.startswith("chroma.sqlite3.max-seq-id-backup-") for fn in os.listdir(palace))
@@ -580,8 +595,11 @@ def test_max_seq_id_segment_filter(tmp_path):
     assert result["segment_repaired"] == [seg["drawers_meta"]]
 
     db_path = os.path.join(palace, "chroma.sqlite3")
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         rows = dict(conn.execute("SELECT segment_id, seq_id FROM max_seq_id").fetchall())
+    finally:
+        conn.close()
     # Filtered segment is fixed; the other three remain poisoned.
     assert rows[seg["drawers_meta"]] == seg["drawers_meta_max"]
     for other in (seg["drawers_vec"], seg["closets_vec"], seg["closets_meta"]):
@@ -602,12 +620,15 @@ def test_max_seq_id_heuristic_decodes_blob_embeddings_seq_id(tmp_path):
     drawers_meta_max = seg["drawers_meta_max"]
     blob_max = drawers_meta_max + 7
     blob_value = blob_max.to_bytes(8, "big")
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute(
             "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
             (seg["drawers_meta"], "d-blob-max", blob_value),
         )
         conn.commit()
+    finally:
+        conn.close()
 
     result = repair.repair_max_seq_id(palace, dry_run=True)
     assert result["after"][seg["drawers_vec"]] == blob_max
@@ -618,7 +639,8 @@ def test_max_seq_id_no_poison_is_noop(tmp_path):
     palace = str(tmp_path / "palace")
     os.makedirs(palace)
     db_path = os.path.join(palace, "chroma.sqlite3")
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.executescript(
             """
             CREATE TABLE segments(
@@ -634,12 +656,17 @@ def test_max_seq_id_no_poison_is_noop(tmp_path):
             """
         )
         conn.commit()
+    finally:
+        conn.close()
 
     result = repair.repair_max_seq_id(palace, assume_yes=True)
     assert result["segment_repaired"] == []
     assert result["backup"] is None
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         rows = dict(conn.execute("SELECT segment_id, seq_id FROM max_seq_id").fetchall())
+    finally:
+        conn.close()
     assert rows == {"s1": 12345}
 
 
@@ -651,8 +678,11 @@ def test_max_seq_id_backup_created(tmp_path):
     assert result["backup"] is not None
     assert os.path.isfile(result["backup"])
 
-    with sqlite3.connect(result["backup"]) as conn:
+    conn = sqlite3.connect(result["backup"])
+    try:
         rows = dict(conn.execute("SELECT segment_id, seq_id FROM max_seq_id").fetchall())
+    finally:
+        conn.close()
     # Backup preserves the poisoned values from before the repair.
     assert rows[seg["drawers_vec"]] == seg["poisoned_values"][seg["drawers_vec"]]
     assert rows[seg["drawers_meta"]] == seg["poisoned_values"][seg["drawers_meta"]]

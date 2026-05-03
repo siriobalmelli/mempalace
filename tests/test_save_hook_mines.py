@@ -10,6 +10,7 @@ Written BEFORE the fix.
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -26,7 +27,7 @@ class TestSaveHookAutoMines:
             "hooks",
             "mempal_save_hook.sh",
         )
-        src = open(hook_path).read()
+        src = Path(hook_path).read_text(encoding="utf-8")
 
         # The hook must drive the conversation mine off TRANSCRIPT_PATH,
         # using `dirname` to derive the parent dir, and tagging it with
@@ -48,7 +49,7 @@ class TestSaveHookAutoMines:
             "hooks",
             "mempal_save_hook.sh",
         )
-        src = open(hook_path).read()
+        src = Path(hook_path).read_text(encoding="utf-8")
 
         # Check if MEMPAL_DIR defaults to empty
         has_empty_default = 'MEMPAL_DIR=""' in src
@@ -77,7 +78,7 @@ class TestShellHookTranscriptValidation:
     @staticmethod
     def _hook_src(name: str) -> str:
         path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks", name)
-        return open(path).read()
+        return Path(path).read_text(encoding="utf-8")
 
     @staticmethod
     def _strip_comments(src: str) -> str:
@@ -112,9 +113,7 @@ class TestShellHookTranscriptValidation:
             end = src.index("\n}\n", start) + 2
             func_src = src[start:end]
             script = tmp_path / "v.sh"
-            script.write_text(
-                f"{func_src}\n" 'is_valid_transcript_path "$1" && echo OK || echo NO\n'
-            )
+            script.write_text(f'{func_src}\nis_valid_transcript_path "$1" && echo OK || echo NO\n')
 
             def run(arg: str) -> str:
                 return subprocess.run(

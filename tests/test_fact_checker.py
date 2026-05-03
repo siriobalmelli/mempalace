@@ -163,7 +163,10 @@ def palace_with_kg(tmp_path):
     palace.mkdir()
     db = str(palace / "knowledge_graph.sqlite3")
     kg = KnowledgeGraph(db_path=db)
-    yield palace, kg
+    try:
+        yield palace, kg
+    finally:
+        kg.close()
 
 
 class TestKGContradictions:
@@ -175,10 +178,13 @@ class TestKGContradictions:
         # Simply construct via the correct signature; raising means the
         # KG constructor has changed in a way that fact_checker must too.
         kg = KnowledgeGraph(db_path=":memory:")
-        # query_entity must exist (this is the method fact_checker calls).
-        assert callable(getattr(kg, "query_entity", None))
-        # The API that fact_checker used to call does NOT exist.
-        assert not hasattr(kg, "query")
+        try:
+            # query_entity must exist (this is the method fact_checker calls).
+            assert callable(getattr(kg, "query_entity", None))
+            # The API that fact_checker used to call does NOT exist.
+            assert not hasattr(kg, "query")
+        finally:
+            kg.close()
 
     def test_relationship_mismatch_detected(self, palace_with_kg):
         """The feature's headline example: text says brother, KG says husband."""
