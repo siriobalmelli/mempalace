@@ -120,19 +120,38 @@
             type = "app";
           };
 
+          checks.coverage =
+            pkgs.runCommand "mempalace-coverage"
+              {
+                nativeBuildInputs = [
+                  config.packages.dev
+                  pkgs.bash
+                  pkgs.git
+                ];
+
+                SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+              }
+              ''
+                export HOME="$TMPDIR"
+                export PYTHONDONTWRITEBYTECODE=1
+                cp -R ${./.} source
+                chmod -R u+w source
+                cd source
+                python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=85
+                touch $out
+              '';
+
           devShells.default = pkgs.mkShell {
-            inputsFrom = [ config.packages.default ];
+            inputsFrom = [ config.packages.dev ];
 
             packages = [
+              pkgs.git
               pkgs.uv
-              python
-              pythonSet.psutil
-              pythonSet.pytest
-              pythonSet.pytest-cov
               pythonSet.ruff
             ];
 
             PYTHONDONTWRITEBYTECODE = "1";
+            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
             UV_PYTHON = python.interpreter;
             UV_PYTHON_DOWNLOADS = "never";
 
@@ -142,7 +161,7 @@
           };
 
           devShells.editable = pkgs.mkShell {
-            inputsFrom = [ config.packages.default ];
+            inputsFrom = [ config.packages.editable ];
 
             packages = [
               config.packages.editable
@@ -151,6 +170,7 @@
             ];
 
             PYTHONDONTWRITEBYTECODE = "1";
+            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
             UV_NO_SYNC = "1";
             UV_PYTHON = editablePythonSet.python.interpreter;
             UV_PYTHON_DOWNLOADS = "never";
@@ -164,6 +184,7 @@
           formatter = pkgs.nixfmt;
 
           packages.default = pythonSet.mkVirtualEnv "mempalace-env" workspace.deps.default;
+          packages.dev = pythonSet.mkVirtualEnv "mempalace-dev-env" devDependencies;
           packages.editable = editablePythonSet.mkVirtualEnv "mempalace-editable-env" devDependencies;
           packages.mempalace = config.packages.default;
         };
