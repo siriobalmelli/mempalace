@@ -707,7 +707,7 @@ def _dedupe_context_expanded_sources(scored: list) -> list:
     deduped: list = []
     for entry in scored:
         source = entry.get("_source_file_full") or ""
-        if entry.get("matched_via") != "drawer" and source:
+        if entry.get("matched_via") in {"drawer+closet", "closet"} and source:
             if source in seen_expanded_sources:
                 continue
             seen_expanded_sources.add(source)

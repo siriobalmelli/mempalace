@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mempalace.searcher import SearchError, search, search_memories
+from mempalace.searcher import (
+    SearchError,
+    _dedupe_context_expanded_sources,
+    search,
+    search_memories,
+)
 
 
 # ── search_memories (API) ──────────────────────────────────────────────
@@ -271,6 +276,39 @@ class TestSearchMemories:
             "alpha.md",
             "alpha.md",
         ]
+
+    def test_source_dedupe_preserves_bm25_hits_from_same_source(self):
+        """BM25 hits are already chunk-level results, not expanded source hits."""
+        scored = [
+            {
+                "matched_via": "bm25_sqlite",
+                "source_file": "alpha.md",
+                "_source_file_full": "/repo/alpha.md",
+                "_chunk_index": 0,
+            },
+            {
+                "matched_via": "bm25_sqlite",
+                "source_file": "alpha.md",
+                "_source_file_full": "/repo/alpha.md",
+                "_chunk_index": 1,
+            },
+            {
+                "matched_via": "drawer+closet",
+                "source_file": "beta.md",
+                "_source_file_full": "/repo/beta.md",
+                "_chunk_index": 0,
+            },
+            {
+                "matched_via": "drawer+closet",
+                "source_file": "beta.md",
+                "_source_file_full": "/repo/beta.md",
+                "_chunk_index": 1,
+            },
+        ]
+
+        deduped = _dedupe_context_expanded_sources(scored)
+
+        assert [hit["_chunk_index"] for hit in deduped] == [0, 1, 0]
 
 
 # ── BM25 internals: None / empty document safety ─────────────────────
