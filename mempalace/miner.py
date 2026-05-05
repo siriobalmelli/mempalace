@@ -309,31 +309,55 @@ def is_excluded_path(path: Path, project_path: Path, exclude_patterns: tuple) ->
 
 
 def _get_git_tracked_files(project_path: Path) -> frozenset:
-    """Return absolute paths tracked by git under project_path."""
-    top_level = subprocess.run(
-        ["git", "-C", str(project_path), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=30,
-    )
-    if top_level.returncode != 0:
+    """Return project-relative paths tracked by git under project_path."""
+    try:
+        inside = subprocess.run(
+            ["git", "-C", str(project_path), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("--only-tracked requires a responsive git worktree") from exc
+    if inside.returncode != 0:
         raise RuntimeError("--only-tracked requires a git worktree")
 
-    repo_root = Path(top_level.stdout.strip()).resolve()
-    tracked = subprocess.run(
-        ["git", "-C", str(project_path), "ls-files", "-z", "--full-name", "--", "."],
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(project_path), "ls-files", "-z", "--", "."],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("--only-tracked failed to list git-tracked files") from exc
     if tracked.returncode != 0:
         raise RuntimeError("--only-tracked failed to list git-tracked files")
 
     paths = tracked.stdout.split(b"\0")
     return frozenset(
-        str((repo_root / raw.decode("utf-8", errors="replace")).resolve()) for raw in paths if raw
+        Path(raw.decode("utf-8", errors="replace")).as_posix().strip("/") for raw in paths if raw
     )
+
+
+def _tracked_parent_dirs(tracked_files: frozenset) -> frozenset:
+    """Return project-relative dirs containing tracked files."""
+    dirs: set = set()
+    for tracked_file in tracked_files:
+        parent = Path(tracked_file).parent
+        while parent.as_posix() not in ("", "."):
+            dirs.add(parent.as_posix())
+            parent = parent.parent
+    return frozenset(dirs)
+
+
+def _relative_to_project(path: Path, project_path: Path) -> str:
+    """Return a normalized project-relative path, or an empty string."""
+    try:
+        return path.relative_to(project_path).as_posix().strip("/")
+    except ValueError:
+        return ""
 
 
 # =============================================================================
@@ -996,6 +1020,7 @@ def scan_project(
     include_paths = normalize_include_paths(include_ignored)
     excludes = normalize_exclude_patterns(exclude_patterns)
     tracked_files = _get_git_tracked_files(project_path) if only_tracked else None
+    tracked_dirs = _tracked_parent_dirs(tracked_files) if tracked_files is not None else None
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -1011,23 +1036,33 @@ def scan_project(
                 active_matchers.append(current_matcher)
 
         dirs[:] = [d for d in dirs if not is_excluded_path(root_path / d, project_path, excludes)]
-        dirs[:] = [
-            d
-            for d in dirs
-            if is_force_included(root_path / d, project_path, include_paths)
-            or not should_skip_dir(d)
-        ]
-        if respect_gitignore and active_matchers:
+        if tracked_dirs is not None:
+            dirs[:] = [
+                d for d in dirs if _relative_to_project(root_path / d, project_path) in tracked_dirs
+            ]
+        else:
             dirs[:] = [
                 d
                 for d in dirs
                 if is_force_included(root_path / d, project_path, include_paths)
-                or not is_gitignored(root_path / d, active_matchers, is_dir=True)
+                or not should_skip_dir(d)
             ]
+            if respect_gitignore and active_matchers:
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if is_force_included(root_path / d, project_path, include_paths)
+                    or not is_gitignored(root_path / d, active_matchers, is_dir=True)
+                ]
 
         for filename in filenames:
             filepath = root_path / filename
             if is_excluded_path(filepath, project_path, excludes):
+                continue
+            if (
+                tracked_files is not None
+                and _relative_to_project(filepath, project_path) not in tracked_files
+            ):
                 continue
             force_include = is_force_included(filepath, project_path, include_paths)
             exact_force_include = is_exact_force_include(filepath, project_path, include_paths)
@@ -1036,13 +1071,16 @@ def scan_project(
                 continue
             if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
                 continue
-            if respect_gitignore and active_matchers and not force_include:
+            if (
+                tracked_files is None
+                and respect_gitignore
+                and active_matchers
+                and not force_include
+            ):
                 if is_gitignored(filepath, active_matchers, is_dir=False):
                     continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
-                continue
-            if tracked_files is not None and str(filepath.resolve()) not in tracked_files:
                 continue
             # Skip files exceeding size limit
             try:

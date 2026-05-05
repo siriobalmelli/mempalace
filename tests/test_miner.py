@@ -269,6 +269,63 @@ def test_scan_project_only_tracked_filters_untracked_files(tmp_path):
     assert scanned_files(project_root, only_tracked=True) == ["tracked.md"]
 
 
+def test_scan_project_only_tracked_includes_force_added_ignored_files(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+
+    project_root = tmp_path.resolve()
+    write_file(project_root / ".gitignore", "ignored.md\nignored-dir/\n")
+    write_file(project_root / "ignored.md", "tracked despite ignore\n" * 20)
+    write_file(project_root / "ignored-dir" / "kept.md", "tracked ignored dir\n" * 20)
+    write_file(project_root / "ignored-dir" / "drop.md", "untracked ignored dir\n" * 20)
+
+    subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "add", "-f", "ignored.md", "ignored-dir/kept.md"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    assert scanned_files(project_root, only_tracked=True) == ["ignored-dir/kept.md", "ignored.md"]
+
+
+def test_scan_project_only_tracked_is_relative_to_target_subdir(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+
+    project_root = tmp_path.resolve()
+    write_file(project_root / "root.md", "root\n" * 20)
+    write_file(project_root / "docs" / "tracked.md", "tracked\n" * 20)
+    write_file(project_root / "docs" / "untracked.md", "untracked\n" * 20)
+
+    subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "add", "root.md", "docs/tracked.md"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+    )
+
+    assert scanned_files(project_root / "docs", only_tracked=True) == ["tracked.md"]
+
+
+def test_scan_project_exclude_still_beats_only_tracked(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+
+    project_root = tmp_path.resolve()
+    write_file(project_root / "keep.md", "keep\n" * 20)
+    write_file(project_root / "drop.md", "drop\n" * 20)
+
+    subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(["git", "add", "keep.md", "drop.md"], cwd=project_root, check=True)
+
+    assert scanned_files(project_root, only_tracked=True, exclude_patterns=["drop.md"]) == [
+        "keep.md"
+    ]
+
+
 def test_scan_project_only_tracked_requires_git_worktree(tmp_path):
     write_file(tmp_path / "notes.md", "notes\n" * 20)
 
