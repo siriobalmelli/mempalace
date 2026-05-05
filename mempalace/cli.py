@@ -489,6 +489,9 @@ def cmd_mine(args):
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
+    exclude_patterns = []
+    for raw in getattr(args, "exclude", []) or []:
+        exclude_patterns.extend(part.strip() for part in raw.split(",") if part.strip())
 
     # --redetect-origin re-runs corpus_origin on the current corpus state
     # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
@@ -524,6 +527,8 @@ def cmd_mine(args):
             dry_run=args.dry_run,
             respect_gitignore=not args.no_gitignore,
             include_ignored=include_ignored,
+            only_tracked=getattr(args, "only_tracked", False),
+            exclude_patterns=exclude_patterns,
         )
 
 
@@ -1058,6 +1063,17 @@ def main():
         action="append",
         default=[],
         help="Always scan these project-relative paths even if ignored; repeat or pass comma-separated paths",
+    )
+    p_mine.add_argument(
+        "--only-tracked",
+        action="store_true",
+        help="Only mine files tracked by git under the target directory",
+    )
+    p_mine.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Exclude project-relative glob patterns; repeat or pass comma-separated patterns",
     )
     p_mine.add_argument(
         "--agent",

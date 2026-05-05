@@ -12,6 +12,7 @@ import sys
 import shlex
 import hashlib
 import fnmatch
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -232,6 +233,17 @@ def normalize_include_paths(include_ignored: list) -> set:
     return normalized
 
 
+def normalize_exclude_patterns(exclude_patterns: list) -> tuple:
+    """Normalize comma-parsed exclude globs into project-relative patterns."""
+    normalized = []
+    for raw_pattern in exclude_patterns or []:
+        for part in str(raw_pattern).split(","):
+            pattern = part.strip().strip("/")
+            if pattern:
+                normalized.append(pattern)
+    return tuple(normalized)
+
+
 def is_exact_force_include(path: Path, project_path: Path, include_paths: set) -> bool:
     """Return True when a path exactly matches an explicit include override."""
     if not include_paths:
@@ -267,6 +279,61 @@ def is_force_included(path: Path, project_path: Path, include_paths: set) -> boo
             return True
 
     return False
+
+
+def is_excluded_path(path: Path, project_path: Path, exclude_patterns: tuple) -> bool:
+    """Return True when path matches a project-relative exclude glob."""
+    if not exclude_patterns:
+        return False
+
+    try:
+        relative = path.relative_to(project_path).as_posix().strip("/")
+    except ValueError:
+        return False
+
+    if not relative:
+        return False
+
+    parts = relative.split("/")
+    for raw_pattern in exclude_patterns:
+        pattern = raw_pattern.rstrip("/")
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(relative, pattern):
+            return True
+        if fnmatch.fnmatch(path.name, pattern):
+            return True
+        if "/" not in pattern and any(fnmatch.fnmatch(part, pattern) for part in parts):
+            return True
+    return False
+
+
+def _get_git_tracked_files(project_path: Path) -> frozenset:
+    """Return absolute paths tracked by git under project_path."""
+    top_level = subprocess.run(
+        ["git", "-C", str(project_path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    if top_level.returncode != 0:
+        raise RuntimeError("--only-tracked requires a git worktree")
+
+    repo_root = Path(top_level.stdout.strip()).resolve()
+    tracked = subprocess.run(
+        ["git", "-C", str(project_path), "ls-files", "-z", "--full-name", "--", "."],
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if tracked.returncode != 0:
+        raise RuntimeError("--only-tracked failed to list git-tracked files")
+
+    paths = tracked.stdout.split(b"\0")
+    return frozenset(
+        str((repo_root / raw.decode("utf-8", errors="replace")).resolve()) for raw in paths if raw
+    )
 
 
 # =============================================================================
@@ -918,6 +985,8 @@ def scan_project(
     project_dir: str,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    only_tracked: bool = False,
+    exclude_patterns: list = None,
 ) -> list:
     """Return list of all readable file paths."""
     project_path = Path(project_dir).expanduser().resolve()
@@ -925,6 +994,8 @@ def scan_project(
     active_matchers = []
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
+    excludes = normalize_exclude_patterns(exclude_patterns)
+    tracked_files = _get_git_tracked_files(project_path) if only_tracked else None
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -939,6 +1010,7 @@ def scan_project(
             if current_matcher is not None:
                 active_matchers.append(current_matcher)
 
+        dirs[:] = [d for d in dirs if not is_excluded_path(root_path / d, project_path, excludes)]
         dirs[:] = [
             d
             for d in dirs
@@ -955,6 +1027,8 @@ def scan_project(
 
         for filename in filenames:
             filepath = root_path / filename
+            if is_excluded_path(filepath, project_path, excludes):
+                continue
             force_include = is_force_included(filepath, project_path, include_paths)
             exact_force_include = is_exact_force_include(filepath, project_path, include_paths)
 
@@ -967,6 +1041,8 @@ def scan_project(
                     continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
+                continue
+            if tracked_files is not None and str(filepath.resolve()) not in tracked_files:
                 continue
             # Skip files exceeding size limit
             try:
@@ -992,6 +1068,8 @@ def mine(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    only_tracked: bool = False,
+    exclude_patterns: list = None,
     files: list = None,
 ):
     """Mine a project directory into the palace.
@@ -1013,6 +1091,8 @@ def mine(
             dry_run=dry_run,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            only_tracked=only_tracked,
+            exclude_patterns=exclude_patterns,
             files=files,
         )
 
@@ -1027,6 +1107,8 @@ def mine(
                 dry_run=dry_run,
                 respect_gitignore=respect_gitignore,
                 include_ignored=include_ignored,
+                only_tracked=only_tracked,
+                exclude_patterns=exclude_patterns,
                 files=files,
             )
     except MineAlreadyRunning:
@@ -1047,6 +1129,8 @@ def _mine_impl(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    only_tracked: bool = False,
+    exclude_patterns: list = None,
     files: list = None,
 ):
     project_path = Path(project_dir).expanduser().resolve()
@@ -1060,6 +1144,8 @@ def _mine_impl(
             project_dir,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            only_tracked=only_tracked,
+            exclude_patterns=exclude_patterns,
         )
     if limit > 0:
         files = files[:limit]
@@ -1080,6 +1166,11 @@ def _mine_impl(
         print("  .gitignore: DISABLED")
     if include_ignored:
         print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
+    if only_tracked:
+        print("  Git-tracked: ENABLED")
+    normalized_excludes = normalize_exclude_patterns(exclude_patterns)
+    if normalized_excludes:
+        print(f"  Exclude: {', '.join(sorted(normalized_excludes))}")
     print(f"{'-' * 55}\n")
 
     if not dry_run:

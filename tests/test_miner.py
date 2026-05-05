@@ -1,10 +1,12 @@
 import os
 import shlex
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
 import chromadb
+import pytest
 import yaml
 
 from mempalace.miner import load_config, mine, scan_project, status
@@ -251,6 +253,56 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         assert scanned_files(project_root, respect_gitignore=False) == ["main.py"]
     finally:
         shutil.rmtree(tmpdir)
+
+
+def test_scan_project_only_tracked_filters_untracked_files(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+
+    project_root = tmp_path.resolve()
+    write_file(project_root / "tracked.md", "tracked content\n" * 20)
+    write_file(project_root / "untracked.md", "untracked content\n" * 20)
+
+    subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True)
+    subprocess.run(["git", "add", "tracked.md"], cwd=project_root, check=True, capture_output=True)
+
+    assert scanned_files(project_root, only_tracked=True) == ["tracked.md"]
+
+
+def test_scan_project_only_tracked_requires_git_worktree(tmp_path):
+    write_file(tmp_path / "notes.md", "notes\n" * 20)
+
+    with pytest.raises(RuntimeError, match="--only-tracked requires a git worktree"):
+        scan_project(str(tmp_path), only_tracked=True)
+
+
+def test_scan_project_exclude_patterns_filter_files_and_dirs(tmp_path):
+    project_root = tmp_path.resolve()
+    write_file(project_root / "main.md", "main\n" * 20)
+    write_file(project_root / "debug.log", "debug\n" * 20)
+    write_file(project_root / "vendor" / "lib.md", "vendor\n" * 20)
+    write_file(project_root / ".opencode" / "notes.md", "opencode\n" * 20)
+
+    assert scanned_files(
+        project_root,
+        respect_gitignore=False,
+        exclude_patterns=["*.log", "vendor", ".opencode/**"],
+    ) == ["main.md"]
+
+
+def test_scan_project_exclude_beats_include_ignored(tmp_path):
+    project_root = tmp_path.resolve()
+    write_file(project_root / ".gitignore", "docs/\n")
+    write_file(project_root / "docs" / "guide.md", "guide\n" * 20)
+
+    assert (
+        scanned_files(
+            project_root,
+            include_ignored=["docs"],
+            exclude_patterns=["docs/**"],
+        )
+        == []
+    )
 
 
 def test_entity_metadata_finds_cyrillic_names(monkeypatch):
