@@ -181,6 +181,97 @@ class TestSearchMemories:
         assert none_hit["wing"] == "unknown"
         assert none_hit["room"] == "unknown"
 
+    def test_search_memories_dedupes_context_expanded_source_hits(self):
+        """Closet hydration must not return the same expanded source repeatedly."""
+        drawers_col = MagicMock()
+        drawers_col.query.return_value = {
+            "ids": [["a0", "a1", "a2", "b0", "c0"]],
+            "documents": [
+                [
+                    "alpha guardscan chunk zero",
+                    "alpha guardscan chunk one",
+                    "alpha guardscan chunk two",
+                    "beta guardscan chunk",
+                    "gamma guardscan chunk",
+                ]
+            ],
+            "metadatas": [
+                [
+                    {"wing": "w", "room": "r", "source_file": "/repo/alpha.md", "chunk_index": 0},
+                    {"wing": "w", "room": "r", "source_file": "/repo/alpha.md", "chunk_index": 1},
+                    {"wing": "w", "room": "r", "source_file": "/repo/alpha.md", "chunk_index": 2},
+                    {"wing": "w", "room": "r", "source_file": "/repo/beta.md", "chunk_index": 0},
+                    {"wing": "w", "room": "r", "source_file": "/repo/gamma.md", "chunk_index": 0},
+                ]
+            ],
+            "distances": [[0.10, 0.11, 0.12, 0.40, 0.45]],
+        }
+        source_drawers = MagicMock()
+        source_drawers.documents = [
+            "alpha guardscan chunk zero",
+            "alpha guardscan chunk one",
+            "alpha guardscan chunk two",
+        ]
+        source_drawers.metadatas = [
+            {"chunk_index": 0},
+            {"chunk_index": 1},
+            {"chunk_index": 2},
+        ]
+        drawers_col.get.return_value = source_drawers
+
+        closets_col = MagicMock()
+        closets_col.query.return_value = {
+            "documents": [["guardscan|alpha|→a0,a1,a2"]],
+            "metadatas": [[{"source_file": "/repo/alpha.md"}]],
+            "distances": [[0.1]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
+        ):
+            result = search_memories("guardscan", "/fake/path", wing="w", room="r", n_results=3)
+
+        sources = [hit["source_file"] for hit in result["results"]]
+        assert len(result["results"]) == 3
+        assert sources.count("alpha.md") == 1
+        assert "beta.md" in sources
+        assert "gamma.md" in sources
+
+    def test_search_memories_preserves_multiple_direct_hits_per_source(self):
+        """Source dedupe applies only to context-expanded closet hits."""
+        drawers_col = MagicMock()
+        drawers_col.query.return_value = {
+            "ids": [["a0", "a1", "a2"]],
+            "documents": [["alpha chunk zero", "alpha chunk one", "alpha chunk two"]],
+            "metadatas": [
+                [
+                    {"wing": "w", "room": "r", "source_file": "/repo/alpha.md", "chunk_index": 0},
+                    {"wing": "w", "room": "r", "source_file": "/repo/alpha.md", "chunk_index": 1},
+                    {"wing": "w", "room": "r", "source_file": "/repo/alpha.md", "chunk_index": 2},
+                ]
+            ],
+            "distances": [[0.10, 0.20, 0.30]],
+        }
+        closets_col = MagicMock()
+        closets_col.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
+        ):
+            result = search_memories("alpha", "/fake/path", wing="w", room="r", n_results=3)
+
+        assert [hit["source_file"] for hit in result["results"]] == [
+            "alpha.md",
+            "alpha.md",
+            "alpha.md",
+        ]
+
 
 # ── BM25 internals: None / empty document safety ─────────────────────
 

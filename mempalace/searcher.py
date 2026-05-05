@@ -693,6 +693,28 @@ def _apply_candidate_strategy(
         merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
 
 
+def _dedupe_context_expanded_sources(scored: list) -> list:
+    """Keep one context-expanded hit per source, preserving direct chunk hits.
+
+    Drawer-grep hydration ignores the vector-selected chunk and expands a
+    closet-boosted source to that source's keyword-best neighborhood. Multiple
+    closet-boosted chunks from the same source therefore hydrate to the same
+    text and can fill every result slot. Direct drawer hits are left alone so
+    a source can still surface multiple distinct chunks when no hydration is
+    going to collapse them.
+    """
+    seen_expanded_sources: set = set()
+    deduped: list = []
+    for entry in scored:
+        source = entry.get("_source_file_full") or ""
+        if entry.get("matched_via") != "drawer" and source:
+            if source in seen_expanded_sources:
+                continue
+            seen_expanded_sources.add(source)
+        deduped.append(entry)
+    return deduped
+
+
 def _query_drawers_with_stale_retry(
     query: str,
     palace_path: str,
@@ -910,6 +932,7 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
+    scored = _dedupe_context_expanded_sources(scored)
     hits = scored[:n_results]
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
