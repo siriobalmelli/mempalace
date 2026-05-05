@@ -255,6 +255,32 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         shutil.rmtree(tmpdir)
 
 
+def test_scan_project_includes_common_source_extensions(tmp_path):
+    project_root = tmp_path.resolve()
+    for filename in [
+        "flake.nix",
+        "main.zig",
+        "build.zig.zon",
+        "packet.c",
+        "packet.h",
+        "module.tf",
+        "filter.lua",
+        "service.plist",
+    ]:
+        write_file(project_root / filename, "source content\n" * 20)
+
+    assert scanned_files(project_root, respect_gitignore=False) == [
+        "build.zig.zon",
+        "filter.lua",
+        "flake.nix",
+        "main.zig",
+        "module.tf",
+        "packet.c",
+        "packet.h",
+        "service.plist",
+    ]
+
+
 def test_scan_project_only_tracked_filters_untracked_files(tmp_path):
     if shutil.which("git") is None:
         pytest.skip("git unavailable")
