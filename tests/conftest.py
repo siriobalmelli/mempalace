@@ -7,7 +7,8 @@ touch the user's real data or leak temp files on failure.
 HOME is redirected to a temp directory at module load time — before any
 mempalace imports — so that module-level initialisations (e.g.
 ``_kg = KnowledgeGraph()`` in mcp_server) write to a throwaway location
-instead of the real user profile.
+instead of the real user profile. Palace path env vars are also removed so
+they cannot override test fixture config and point tests at live data.
 """
 
 import os
@@ -20,6 +21,9 @@ _session_tmp = tempfile.mkdtemp(prefix="mempalace_session_")
 
 for _var in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"):
     _original_env[_var] = os.environ.get(_var)
+
+for _var in ("MEMPALACE_PALACE_PATH", "MEMPAL_PALACE_PATH"):
+    _original_env[_var] = os.environ.pop(_var, None)
 
 os.environ["HOME"] = _session_tmp
 os.environ["USERPROFILE"] = _session_tmp

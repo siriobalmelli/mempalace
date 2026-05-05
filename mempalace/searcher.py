@@ -16,7 +16,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .palace import get_closets_collection, get_collection
+from .palace import _DEFAULT_BACKEND, get_closets_collection, get_collection
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -27,6 +27,19 @@ logger = logging.getLogger("mempalace_mcp")
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
+
+
+def _is_stale_vector_filter_error(exc: Exception) -> bool:
+    """Return True for Chroma query errors caused by stale HNSW filter IDs."""
+    return "error finding id" in str(exc).lower()
+
+
+def _close_default_backend_cache(palace_path: str) -> None:
+    """Drop the process-local Chroma client cache used by search paths."""
+    try:
+        _DEFAULT_BACKEND.close_palace(palace_path)
+    except Exception:
+        logger.debug("Failed to close cached search backend", exc_info=True)
 
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
@@ -680,6 +693,61 @@ def _apply_candidate_strategy(
         merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
 
 
+def _query_drawers_with_stale_retry(
+    query: str,
+    palace_path: str,
+    where: dict,
+    n_results: int,
+    wing: str,
+    room: str,
+) -> dict:
+    """Run the primary drawer vector query, reopening once on stale HNSW IDs."""
+    try:
+        drawers_col = get_collection(palace_path, create=False)
+    except Exception as e:
+        logger.error("No palace found at %s: %s", palace_path, e)
+        return {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+
+    dkwargs = {
+        "query_texts": [query],
+        "n_results": n_results * 3,  # over-fetch for re-ranking
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        dkwargs["where"] = where
+
+    try:
+        return {"drawer_results": drawers_col.query(**dkwargs), "drawers_col": drawers_col}
+    except Exception as e:
+        if not _is_stale_vector_filter_error(e):
+            return {"error": f"Search error: {e}"}
+
+    # Chroma raises "Error finding id" when metadata filtering selects an ID
+    # that is present in sqlite but absent from this process's loaded HNSW
+    # segment. This happens when another MCP process writes between our client
+    # open and query. Reopen once; if Chroma is still stale, return sqlite-only
+    # BM25 rather than forgetting.
+    logger.warning("Vector query saw stale HNSW filter IDs; reopening search backend")
+    _close_default_backend_cache(palace_path)
+    try:
+        drawers_col = get_collection(palace_path, create=False)
+        return {"drawer_results": drawers_col.query(**dkwargs), "drawers_col": drawers_col}
+    except Exception as retry_error:
+        fallback = _bm25_only_via_sqlite(
+            query,
+            palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+        )
+        fallback["fallback_reason"] = "vector_query_stale_filter_ids"
+        fallback["vector_error"] = str(retry_error)
+        return fallback
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -741,15 +809,6 @@ def search_memories(
             n_results=n_results,
         )
 
-    try:
-        drawers_col = get_collection(palace_path, create=False)
-    except Exception as e:
-        logger.error("No palace found at %s: %s", palace_path, e)
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
-
     where = build_where_filter(wing, room)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
@@ -759,17 +818,18 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
-    try:
-        dkwargs = {
-            "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            dkwargs["where"] = where
-        drawer_results = drawers_col.query(**dkwargs)
-    except Exception as e:
-        return {"error": f"Search error: {e}"}
+    drawer_query = _query_drawers_with_stale_retry(
+        query,
+        palace_path,
+        where,
+        n_results,
+        wing,
+        room,
+    )
+    if "drawer_results" not in drawer_query:
+        return drawer_query
+    drawer_results = drawer_query["drawer_results"]
+    drawers_col = drawer_query["drawers_col"]
 
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)

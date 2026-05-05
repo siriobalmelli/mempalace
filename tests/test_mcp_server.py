@@ -1758,6 +1758,26 @@ class TestCacheInvalidation:
         assert "Reconnected" in result["message"]
         assert isinstance(result["drawers"], int)
 
+    def test_reconnect_closes_search_backend_cache(self, monkeypatch, config, palace_path, kg):
+        """Reconnect must clear both MCP and searcher Chroma clients.
+
+        ``tool_search`` routes through searcher.py, which owns a separate
+        ChromaBackend cache from mcp_server._get_collection(). Clearing only
+        the MCP cache leaves filtered search vulnerable to stale HNSW IDs after
+        external writes.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _StubCollection())
+        closed = []
+        monkeypatch.setattr(mcp_server, "_close_search_backend_cache", lambda: closed.append(True))
+
+        result = mcp_server.tool_reconnect()
+
+        assert result["success"] is True
+        assert closed == [True]
+
     def test_get_collection_create_true_avoids_get_or_create_on_reopen(
         self, monkeypatch, config, palace_path, kg
     ):

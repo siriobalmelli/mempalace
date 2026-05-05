@@ -84,6 +84,67 @@ class TestSearchMemories:
         assert "error" in result
         assert "query failed" in result["error"]
 
+    def test_search_memories_reopens_on_stale_filter_id_error(self):
+        """A stale Chroma HNSW cache must not make filtered MCP search fail.
+
+        Chroma raises "Error finding id" when a metadata filter selects an ID
+        that exists in sqlite but is missing from this process's loaded HNSW
+        segment. That is a normal multi-process race: another MCP server wrote
+        after this process opened its search client. Search should reopen once
+        instead of returning an error to the model.
+        """
+        stale_col = MagicMock()
+        stale_col.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+
+        fresh_col = MagicMock()
+        fresh_col.query.return_value = {
+            "ids": [["drawer_1"]],
+            "documents": [["fresh drawer"]],
+            "metadatas": [[{"wing": "w", "room": "r", "source_file": "x.md"}]],
+            "distances": [[0.1]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", side_effect=[stale_col, fresh_col]),
+            patch(
+                "mempalace.searcher.get_closets_collection", side_effect=RuntimeError("no closets")
+            ),
+            patch("mempalace.searcher._close_default_backend_cache") as mock_close,
+        ):
+            result = search_memories("fresh", "/fake/path", wing="w")
+
+        assert "error" not in result
+        assert result["results"][0]["text"] == "fresh drawer"
+        mock_close.assert_called_once_with("/fake/path")
+
+    def test_search_memories_bm25_fallback_when_stale_retry_fails(self):
+        """If reopening still sees stale HNSW IDs, return sqlite BM25 hits."""
+        stale_col = MagicMock()
+        stale_col.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+        fallback = {
+            "query": "fresh",
+            "filters": {"wing": "w", "room": None},
+            "results": [{"text": "fresh drawer", "matched_via": "bm25_sqlite"}],
+            "fallback": "bm25_only_via_sqlite",
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=stale_col),
+            patch("mempalace.searcher._close_default_backend_cache"),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=fallback) as mock_bm25,
+        ):
+            result = search_memories("fresh", "/fake/path", wing="w")
+
+        assert "error" not in result
+        assert result["results"][0]["matched_via"] == "bm25_sqlite"
+        assert result["fallback_reason"] == "vector_query_stale_filter_ids"
+        assert "Error finding id" in result["vector_error"]
+        mock_bm25.assert_called_once()
+
     def test_search_memories_filters_in_result(self, palace_path, seeded_collection):
         result = search_memories("test", palace_path, wing="project", room="backend")
         assert result["filters"]["wing"] == "project"

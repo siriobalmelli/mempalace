@@ -500,6 +500,16 @@ def _write_lock_timeout_result(exc: Exception) -> dict:
     }
 
 
+def _close_search_backend_cache() -> None:
+    """Drop the separate Chroma client cache used by searcher.py."""
+    try:
+        from .palace import _DEFAULT_BACKEND
+
+        _DEFAULT_BACKEND.close_palace(_config.palace_path)
+    except Exception:
+        logger.debug("Failed to close cached search backend", exc_info=True)
+
+
 # ==================== READ TOOLS ====================
 
 
@@ -977,6 +987,7 @@ def tool_add_drawer(
                     ],
                 )
                 _metadata_cache = None
+                _close_search_backend_cache()
                 invalidate_graph_cache()
                 logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
                 return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
@@ -1020,6 +1031,7 @@ def tool_delete_drawer(drawer_id: str):
             try:
                 col.delete(ids=[drawer_id])
                 _metadata_cache = None
+                _close_search_backend_cache()
                 invalidate_graph_cache()
                 logger.info(f"Deleted drawer: {drawer_id}")
                 return {"success": True, "drawer_id": drawer_id}
@@ -1401,6 +1413,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                     ],
                 )
                 _metadata_cache = None
+                _close_search_backend_cache()
                 invalidate_graph_cache()
                 logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
                 return {
@@ -1575,12 +1588,17 @@ def tool_reconnect():
         _collection_cache, \
         _palace_db_inode, \
         _palace_db_mtime, \
+        _metadata_cache, \
+        _metadata_cache_time, \
         _vector_disabled, \
         _vector_disabled_reason
     _client_cache = None
     _collection_cache = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
+    _metadata_cache = None
+    _metadata_cache_time = 0
+    _close_search_backend_cache()
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
     # still applies after the reconnect.
